@@ -1,0 +1,9 @@
+numpy
+pandas
+scipy
+scikit-learn
+nltk
+notebook
+torch
+pytest
+transformers
