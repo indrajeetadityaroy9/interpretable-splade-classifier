@@ -11,22 +11,13 @@ Example usage:
 
     # Option B: HuggingFace datasets
     texts, labels, meta = load_classification_data(dataset="ag_news", split="train")
-
-    # Using DataLoaders
-    train_loader, test_loader, meta = get_data_loaders(
-        train_path="data/train.csv",  # OR dataset="ag_news"
-        test_path="data/test.csv",
-    )
 """
 
-from typing import Tuple, Optional, List, Dict, Any, Union
+from typing import Tuple, Optional, List, Dict, Any
 import os
 import random
 
 import pandas as pd
-import torch
-from torch.utils.data import DataLoader, Dataset
-from transformers import AutoTokenizer
 
 
 # =============================================================================
@@ -111,6 +102,9 @@ def load_classification_data(
     split: str = "train",
     # Common options
     max_samples: Optional[int] = None,
+    seed: Optional[int] = None,
+    # Label consistency (pass train's mapping to test to ensure consistency)
+    label_mapping: Optional[Dict[int, int]] = None,
 ) -> Tuple[List[str], List[int], Dict[str, Any]]:
     """
     Load text classification data from local files OR HuggingFace datasets.
@@ -122,12 +116,16 @@ def load_classification_data(
         dataset: HuggingFace dataset name (Option B)
         split: Dataset split ("train", "test", "validation")
         max_samples: Limit number of samples (for debugging)
+        seed: Random seed for sampling (default: 42 if not provided)
+        label_mapping: Pre-existing label mapping from training set. When provided,
+            this mapping is applied to labels instead of computing a new one.
+            Use this to ensure train and test splits use consistent label encoding.
 
     Returns:
         Tuple of (texts, labels, metadata)
         - texts: List[str] of input texts
         - labels: List[int] of integer labels
-        - metadata: Dict with num_labels, class_names, dataset info
+        - metadata: Dict with num_labels, class_names, dataset info, label_mapping
 
     Examples:
         # Option A: Local CSV/TSV file
@@ -136,17 +134,27 @@ def load_classification_data(
         # Option B: HuggingFace dataset
         texts, labels, meta = load_classification_data(dataset="ag_news", split="train")
 
+        # Load test set with train's label mapping for consistency
+        train_texts, train_labels, train_meta = load_classification_data(file_path="train.csv")
+        test_texts, test_labels, test_meta = load_classification_data(
+            file_path="test.csv",
+            label_mapping=train_meta['label_mapping']
+        )
+
     Raises:
         ValueError: If neither file_path nor dataset is specified
+        ValueError: If label_mapping is provided but labels contain unknown values
     """
     if file_path is not None:
         # Option A: Load from local file
         texts, labels, metadata = _load_from_file(
-            file_path, text_column, label_column
+            file_path, text_column, label_column, label_mapping=label_mapping
         )
     elif dataset is not None:
         # Option B: Load from HuggingFace
-        texts, labels, metadata = _load_from_huggingface(dataset, split)
+        texts, labels, metadata = _load_from_huggingface(
+            dataset, split, label_mapping=label_mapping
+        )
     else:
         raise ValueError(
             "Must specify either 'file_path' (for local files) or "
@@ -155,31 +163,91 @@ def load_classification_data(
 
     # Sample if requested
     if max_samples is not None and len(texts) > max_samples:
-        random.seed(42)  # Fixed seed for reproducibility
+        # Use provided seed or default to 42 for reproducibility
+        sample_seed = seed if seed is not None else 42
+        random.seed(sample_seed)
         indices = random.sample(range(len(texts)), max_samples)
         texts = [texts[i] for i in indices]
         labels = [labels[i] for i in indices]
         metadata["num_samples"] = max_samples
+        metadata["sample_seed"] = sample_seed
     else:
         metadata["num_samples"] = len(texts)
 
     return texts, labels, metadata
 
 
+def _normalize_labels(
+    labels: List[int],
+) -> Tuple[List[int], Dict[int, int], int]:
+    """
+    Normalize labels to be 0-indexed and contiguous.
+
+    Handles cases where labels are:
+    - Non-contiguous: [0, 2, 5] -> [0, 1, 2]
+    - Not 0-indexed: [1, 2, 3] -> [0, 1, 2]
+
+    Args:
+        labels: List of integer labels (possibly non-contiguous)
+
+    Returns:
+        Tuple of:
+        - normalized_labels: List[int] with values in [0, num_classes-1]
+        - label_mapping: Dict mapping original labels to normalized labels
+        - num_labels: Number of unique classes
+
+    Example:
+        >>> _normalize_labels([5, 2, 5, 0, 2])
+        ([2, 1, 2, 0, 1], {0: 0, 2: 1, 5: 2}, 3)
+    """
+    unique_labels = sorted(set(labels))
+    num_labels = len(unique_labels)
+
+    # Check if already normalized (0-indexed and contiguous)
+    expected = list(range(num_labels))
+    if unique_labels == expected:
+        # Already normalized, no mapping needed
+        return labels, {i: i for i in unique_labels}, num_labels
+
+    # Create mapping from original to normalized labels
+    label_mapping = {orig: norm for norm, orig in enumerate(unique_labels)}
+
+    # Apply mapping
+    normalized_labels = [label_mapping[l] for l in labels]
+
+    # Log warning about remapping
+    import warnings
+    warnings.warn(
+        f"Labels were not 0-indexed and contiguous. "
+        f"Remapped {unique_labels} -> {list(range(num_labels))}. "
+        f"Original label mapping: {label_mapping}",
+        UserWarning
+    )
+
+    return normalized_labels, label_mapping, num_labels
+
+
 def _load_from_file(
     file_path: str,
     text_column: str,
     label_column: str,
+    label_mapping: Optional[Dict[int, int]] = None,
 ) -> Tuple[List[str], List[int], Dict[str, Any]]:
-    """Load data from a local CSV/TSV file."""
-    # Auto-detect separator based on file extension
+    """Load data from a local CSV/TSV file.
+
+    Args:
+        file_path: Path to the CSV/TSV file
+        text_column: Name of the text column
+        label_column: Name of the label column
+        label_mapping: Optional pre-existing label mapping to apply.
+            If provided, this mapping is used instead of computing a new one.
+    """
     ext = os.path.splitext(file_path)[1].lower()
     if ext in (".tsv", ".txt"):
         sep = "\t"
     else:
         sep = ","
 
-    # Try loading with header first, fall back to no header
     try:
         df = pd.read_csv(file_path, sep=sep)
         if text_column not in df.columns:
@@ -188,25 +256,33 @@ def _load_from_file(
                 file_path, sep=sep, header=None,
                 names=["id", text_column, label_column]
             )
-    except Exception:
-        # Fall back to no header
-        df = pd.read_csv(
-            file_path, sep=sep, header=None,
-            names=["id", text_column, label_column]
-        )
+    except (FileNotFoundError, pd.errors.ParserError, pd.errors.EmptyDataError) as e:
+        raise ValueError(f"Failed to load {file_path}: {e}")
 
     texts = df[text_column].astype(str).tolist()
-    labels = df[label_column].astype(int).tolist()
+    raw_labels = df[label_column].astype(int).tolist()
 
-    # Infer num_labels
-    unique_labels = set(labels)
-    num_labels = max(unique_labels) + 1
+    if label_mapping is not None:
+        # Validate that all labels are in the mapping
+        unknown_labels = set(raw_labels) - set(label_mapping.keys())
+        if unknown_labels:
+            raise ValueError(
+                f"Labels {unknown_labels} in {file_path} not found in provided label_mapping. "
+                f"Known labels: {set(label_mapping.keys())}. "
+                f"Ensure train and test sets have the same label space."
+            )
+        labels = [label_mapping[l] for l in raw_labels]
+        num_labels = len(set(label_mapping.values()))
+    else:
+        # Validate and normalize labels to be 0-indexed and contiguous
+        labels, label_mapping, num_labels = _normalize_labels(raw_labels)
 
     metadata = {
         "source": "file",
         "file_path": file_path,
         "num_labels": num_labels,
         "class_names": None,
+        "label_mapping": label_mapping,  # Original label -> normalized label
     }
 
     return texts, labels, metadata
@@ -215,8 +291,15 @@ def _load_from_file(
 def _load_from_huggingface(
     dataset_name: str,
     split: str,
+    label_mapping: Optional[Dict[int, int]] = None,
 ) -> Tuple[List[str], List[int], Dict[str, Any]]:
-    """Load data from HuggingFace datasets."""
+    """Load data from HuggingFace datasets.
+
+    Args:
+        dataset_name: Name of the HuggingFace dataset
+        split: Dataset split (train, test, validation)
+        label_mapping: Optional pre-existing label mapping to apply.
+    """
     try:
         from datasets import load_dataset as hf_load_dataset
     except ImportError:
@@ -251,14 +334,25 @@ def _load_from_huggingface(
 
     # Extract texts and labels
     texts = list(ds[text_column])
-    labels = list(ds[label_column])
+    raw_labels = [int(l) for l in ds[label_column]]
 
-    # Ensure labels are integers
-    labels = [int(l) for l in labels]
-
-    # Infer num_labels if not in registry
-    if num_labels is None:
-        num_labels = max(labels) + 1
+    # Apply existing mapping or use registry/compute new one
+    if label_mapping is not None:
+        # Validate that all labels are in the mapping
+        unknown_labels = set(raw_labels) - set(label_mapping.keys())
+        if unknown_labels:
+            raise ValueError(
+                f"Labels {unknown_labels} in {dataset_name}/{split} not found in provided label_mapping. "
+                f"Known labels: {set(label_mapping.keys())}. "
+                f"Ensure train and test sets have the same label space."
+            )
+        labels = [label_mapping[l] for l in raw_labels]
+        num_labels = len(set(label_mapping.values()))
+    elif num_labels is None:
+        labels, label_mapping, num_labels = _normalize_labels(raw_labels)
+    else:
+        labels = raw_labels
+        label_mapping = {i: i for i in range(num_labels)}
 
     metadata = {
         "source": "huggingface",
@@ -266,6 +360,7 @@ def _load_from_huggingface(
         "split": split,
         "num_labels": num_labels,
         "class_names": class_names,
+        "label_mapping": label_mapping,
     }
 
     return texts, labels, metadata
@@ -274,229 +369,3 @@ def _load_from_huggingface(
 def list_supported_datasets() -> List[str]:
     """Return list of supported HuggingFace dataset names."""
     return list(SUPPORTED_DATASETS.keys())
-
-
-# =============================================================================
-# PyTorch Dataset Class
-# =============================================================================
-
-class TextClassificationDataset(Dataset):
-    """
-    PyTorch Dataset for text classification with transformer tokenization.
-
-    Args:
-        texts: List of text strings
-        labels: List of integer labels
-        tokenizer: HuggingFace tokenizer
-        max_length: Maximum sequence length
-        num_labels: Number of classes (1 for binary, >1 for multi-class)
-    """
-
-    def __init__(
-        self,
-        texts: List[str],
-        labels: List[int],
-        tokenizer,
-        max_length: int = 128,
-        num_labels: int = 1,
-    ):
-        self.texts = texts
-        self.labels = labels
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        self.num_labels = num_labels
-
-    def __len__(self) -> int:
-        return len(self.texts)
-
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        text = self.texts[idx]
-        label = self.labels[idx]
-
-        # Tokenize
-        encoding = self.tokenizer(
-            text,
-            max_length=self.max_length,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt"
-        )
-
-        # Return appropriate label dtype based on classification type
-        if self.num_labels == 1:
-            # Binary classification: float for BCE loss
-            label_tensor = torch.tensor(label, dtype=torch.float32)
-        else:
-            # Multi-class classification: long for CrossEntropy loss
-            label_tensor = torch.tensor(label, dtype=torch.long)
-
-        return {
-            "input_ids": encoding["input_ids"].squeeze(0),
-            "attention_mask": encoding["attention_mask"].squeeze(0),
-            "label": label_tensor,
-        }
-
-
-# =============================================================================
-# DataLoader Factory
-# =============================================================================
-
-def get_data_loaders(
-    # Option A: Local files
-    train_path: Optional[str] = None,
-    test_path: Optional[str] = None,
-    text_column: str = "text",
-    label_column: str = "label",
-    # Option B: HuggingFace dataset
-    dataset: Optional[str] = None,
-    # Common options
-    batch_size: int = 32,
-    max_length: int = 128,
-    num_workers: int = 0,
-    tokenizer_name: str = "distilbert-base-uncased",
-    max_train_samples: Optional[int] = None,
-    max_test_samples: Optional[int] = None,
-) -> Tuple[DataLoader, DataLoader, Dict[str, Any]]:
-    """
-    Create train and test DataLoaders for text classification.
-
-    Supports two modes:
-    1. Local files: Specify train_path and test_path
-    2. HuggingFace: Specify dataset name
-
-    Args:
-        train_path: Path to training CSV/TSV file (Option A)
-        test_path: Path to test CSV/TSV file (Option A)
-        text_column: Column name for text (local files)
-        label_column: Column name for labels (local files)
-        dataset: HuggingFace dataset name (Option B)
-        batch_size: Batch size for DataLoaders
-        max_length: Maximum sequence length for tokenization
-        num_workers: Number of workers for data loading
-        tokenizer_name: HuggingFace tokenizer name
-        max_train_samples: Limit training samples (for debugging)
-        max_test_samples: Limit test samples (for debugging)
-
-    Returns:
-        (train_loader, test_loader, metadata) tuple
-
-    Examples:
-        # Option A: Local files
-        train_loader, test_loader, meta = get_data_loaders(
-            train_path="data/train.csv",
-            test_path="data/test.csv",
-        )
-
-        # Option B: HuggingFace dataset
-        train_loader, test_loader, meta = get_data_loaders(
-            dataset="ag_news",
-            max_train_samples=10000,
-        )
-
-    Raises:
-        ValueError: If neither local files nor dataset is specified
-    """
-    # Validate inputs
-    has_local_files = train_path is not None and test_path is not None
-    has_hf_dataset = dataset is not None
-
-    if not has_local_files and not has_hf_dataset:
-        raise ValueError(
-            "Must specify either (train_path, test_path) for local files "
-            "or 'dataset' for HuggingFace datasets"
-        )
-
-    if has_local_files and has_hf_dataset:
-        raise ValueError(
-            "Cannot specify both local files and HuggingFace dataset. "
-            "Choose one option."
-        )
-
-    # Load data
-    if has_local_files:
-        # Option A: Local files
-        train_texts, train_labels, train_meta = load_classification_data(
-            file_path=train_path,
-            text_column=text_column,
-            label_column=label_column,
-            max_samples=max_train_samples,
-        )
-        test_texts, test_labels, test_meta = load_classification_data(
-            file_path=test_path,
-            text_column=text_column,
-            label_column=label_column,
-            max_samples=max_test_samples,
-        )
-        # Use the larger num_labels from train/test
-        num_labels = max(train_meta["num_labels"], test_meta["num_labels"])
-        class_names = None
-        source = f"files: {train_path}, {test_path}"
-    else:
-        # Option B: HuggingFace dataset
-        train_texts, train_labels, train_meta = load_classification_data(
-            dataset=dataset,
-            split="train",
-            max_samples=max_train_samples,
-        )
-        test_texts, test_labels, test_meta = load_classification_data(
-            dataset=dataset,
-            split="test",
-            max_samples=max_test_samples,
-        )
-        num_labels = train_meta["num_labels"]
-        class_names = train_meta.get("class_names")
-        source = f"huggingface: {dataset}"
-
-    # For binary classification with 2 classes, use num_labels=1 (BCE loss)
-    model_num_labels = 1 if num_labels == 2 else num_labels
-
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-
-    # Create datasets
-    train_dataset = TextClassificationDataset(
-        texts=train_texts,
-        labels=train_labels,
-        tokenizer=tokenizer,
-        max_length=max_length,
-        num_labels=model_num_labels,
-    )
-
-    test_dataset = TextClassificationDataset(
-        texts=test_texts,
-        labels=test_labels,
-        tokenizer=tokenizer,
-        max_length=max_length,
-        num_labels=model_num_labels,
-    )
-
-    # Create DataLoaders
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
-    )
-
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
-    )
-
-    # Build metadata
-    metadata = {
-        "source": source,
-        "num_labels": model_num_labels,
-        "num_classes": num_labels,
-        "class_names": class_names,
-        "train_samples": len(train_texts),
-        "test_samples": len(test_texts),
-        "batch_size": batch_size,
-        "max_length": max_length,
-    }
-
-    return train_loader, test_loader, metadata

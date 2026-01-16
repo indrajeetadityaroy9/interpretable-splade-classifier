@@ -9,7 +9,7 @@ Internal (not for direct use):
 """
 
 import os
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Any, Set
 
 import torch
 import torch.nn as nn
@@ -37,36 +37,47 @@ class _SpladeModule(nn.Module):
         model_name: str = "distilbert-base-uncased",
         max_length: int = 128,
         num_labels: int = 1,  # Binary classification
+        load_mlm_weights: bool = True,  # Load pretrained MLM head for interpretability
     ):
         super().__init__()
 
         self.model_name = model_name
         self.max_length = max_length
         self.vocab_size = 30522  # DistilBERT vocab size
+        self.mlm_pretrained = load_mlm_weights  # Track for save/load
 
-        # Load DistilBERT with MLM head weights
         self.bert = AutoModel.from_pretrained(model_name)
 
-        # MLM projection to vocabulary (for SPLADE-style sparse vectors)
-        # DistilBERT hidden size is 768
+        # MLM projection layers (DistilBERT hidden size = 768)
         self.vocab_transform = nn.Linear(768, 768)
         self.vocab_layer_norm = nn.LayerNorm(768)
         self.vocab_projector = nn.Linear(768, self.vocab_size)
 
+        # Initialize MLM head from pretrained weights for interpretable explanations
+        if load_mlm_weights:
+            self._load_pretrained_mlm_head(model_name)
+
         # Classification head (on top of sparse vectors)
         self.classifier = nn.Linear(self.vocab_size, num_labels)
 
-        # For BEIR retrieval compatibility
-        self.vectorizer = self._get_sparse_vectors
+    def _load_pretrained_mlm_head(self, model_name: str):
+        """
+        Load pretrained MLM head weights from DistilBertForMaskedLM.
 
-    def _get_sparse_vectors(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor
-    ) -> torch.Tensor:
-        """Get only sparse vectors (for retrieval use)."""
-        _, sparse_vec = self.forward(input_ids, attention_mask)
-        return sparse_vec
+        This is critical for interpretability - the pretrained MLM head
+        maps hidden states to vocabulary tokens in a semantically meaningful way.
+        Without this, the vocabulary projections are random and explanations
+        will show nonsensical terms.
+        """
+        from transformers import DistilBertForMaskedLM
+
+        mlm_model = DistilBertForMaskedLM.from_pretrained(model_name)
+
+        self.vocab_transform.load_state_dict(mlm_model.vocab_transform.state_dict())
+        self.vocab_layer_norm.load_state_dict(mlm_model.vocab_layer_norm.state_dict())
+        self.vocab_projector.load_state_dict(mlm_model.vocab_projector.state_dict())
+
+        del mlm_model
 
     def forward(
         self,
@@ -84,11 +95,9 @@ class _SpladeModule(nn.Module):
             logits: Classification logits [batch, 1]
             sparse_vec: Sparse document vectors [batch, vocab_size]
         """
-        # Get DistilBERT hidden states
         outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
         hidden_states = outputs.last_hidden_state  # [batch, seq_len, 768]
 
-        # Project to vocabulary space (MLM-style)
         transformed = self.vocab_transform(hidden_states)
         transformed = F.gelu(transformed)
         transformed = self.vocab_layer_norm(transformed)
@@ -101,17 +110,13 @@ class _SpladeModule(nn.Module):
                      not self.training)
 
         if use_triton:
-            sparse_vec = splade_aggregate(mlm_logits, attention_mask, use_triton=True)
+            sparse_vec = splade_aggregate(mlm_logits, attention_mask, backend="triton")
         else:
-            # PyTorch fallback
             activated = torch.log1p(F.relu(mlm_logits))
-            # Mask padding tokens
             mask_expanded = attention_mask.unsqueeze(-1).float()
             activated = activated * mask_expanded
-            # Max-pool over sequence
             sparse_vec = activated.max(dim=1).values  # [batch, vocab_size]
 
-        # Classification
         logits = self.classifier(sparse_vec)  # [batch, 1]
 
         return logits, sparse_vec
@@ -151,6 +156,7 @@ class SPLADEClassifier:
         verbose: bool = True,
         num_labels: int = 1,
         class_names: Optional[List[str]] = None,
+        load_mlm_weights: bool = True,
     ):
         self.model_name = model_name
         self.max_length = max_length
@@ -161,13 +167,15 @@ class SPLADEClassifier:
         self.verbose = verbose
         self.num_labels = num_labels
         self.class_names = class_names
+        self.load_mlm_weights = load_mlm_weights
 
-        # Set seed for reproducibility
         set_seed(random_state)
-
-        # Initialize model and tokenizer
         self.device = get_device()
-        self.model = _SpladeModule(model_name, max_length, num_labels=num_labels)
+        self.model = _SpladeModule(
+            model_name, max_length,
+            num_labels=num_labels,
+            load_mlm_weights=load_mlm_weights,
+        )
         self.model.to(self.device)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
 
@@ -186,7 +194,7 @@ class SPLADEClassifier:
         self,
         X: List[str],
         return_vectors: bool = False,
-    ) -> Dict[str, any]:
+    ) -> Dict[str, Any]:
         """
         Core batch inference logic - tokenize, batch, forward pass.
 
@@ -236,7 +244,6 @@ class SPLADEClassifier:
         X: List[str],
         y,
         epochs: int = 5,
-        validation_data: Optional[Tuple[List[str], List]] = None
     ) -> "SPLADEClassifier":
         """
         Train the classifier on texts and labels.
@@ -245,7 +252,6 @@ class SPLADEClassifier:
             X: List of text strings
             y: Labels (array-like, integers for multi-class)
             epochs: Number of training epochs
-            validation_data: Optional (texts, labels) tuple for validation
 
         Returns:
             self
@@ -302,6 +308,13 @@ class SPLADEClassifier:
 
                 flops_loss = self.flops_lambda * flops_regularization(sparse_vec)
                 loss = cls_loss + flops_loss
+
+                # Invariant: loss should be finite
+                if not torch.isfinite(loss):
+                    raise RuntimeError(
+                        f"Loss became non-finite: {loss.item()}. "
+                        f"cls_loss={cls_loss.item()}, flops_loss={flops_loss.item()}"
+                    )
 
                 loss.backward()
                 optimizer.step()
@@ -374,52 +387,151 @@ class SPLADEClassifier:
         correct = sum(p == t for p, t in zip(predictions, y))
         return correct / len(y)
 
-    def get_sparsity(self, X: List[str]) -> float:
+    def get_sparsity(self, X: List[str], threshold: float = 1e-6) -> float:
         """
-        Compute average sparsity of vectors for texts.
+        Compute average per-document sparsity of vectors for texts.
 
         Args:
             X: List of text strings
+            threshold: Values with abs < threshold are considered zero
 
         Returns:
-            Sparsity percentage (0-100)
+            Sparsity percentage (0-100), averaged across documents
         """
         vectors = self.transform(X)
-        sparsity = (vectors == 0).float().mean().item() * 100
+        # Compute per-document sparsity (proportion of zeros per row)
+        per_doc_zeros = (vectors.abs() < threshold).sum(dim=1).float()
+        per_doc_sparsity = per_doc_zeros / vectors.shape[1]
+        # Average across documents
+        sparsity = per_doc_sparsity.mean().item() * 100
         return sparsity
 
-    def explain(self, text: str, top_k: int = 20) -> List[Tuple[str, float]]:
+    def _should_filter_token(
+        self,
+        token_id: int,
+        token_str: str,
+        filter_special: bool = True,
+        filter_stopwords: bool = True,
+        filter_subwords: bool = True,
+        min_length: int = 2,
+        stopwords_set: Optional[Set[str]] = None,
+    ) -> bool:
+        """
+        Determine if a token should be filtered from explanations.
+
+        Args:
+            token_id: Vocabulary index of the token
+            token_str: Decoded token string
+            filter_special: Filter special tokens like [CLS], [unused123]
+            filter_stopwords: Filter common stopwords
+            filter_subwords: Filter ##-prefixed subword tokens
+            min_length: Minimum token length (filters punctuation)
+            stopwords_set: Pre-loaded stopwords (computed once if None)
+
+        Returns:
+            True if token should be filtered, False otherwise
+        """
+        # Filter special tokens (IDs 0-999 are [PAD], [UNK], [unused...] etc.)
+        if filter_special:
+            if token_id < 1000:  # Special token range
+                return True
+            if token_str.startswith('[') and token_str.endswith(']'):
+                return True
+
+        # Filter subword pieces
+        if filter_subwords and token_str.startswith('##'):
+            return True
+
+        # Filter by length (catches punctuation and single chars)
+        if len(token_str) < min_length:
+            return True
+
+        # Filter stopwords
+        if filter_stopwords and stopwords_set:
+            if token_str.lower() in stopwords_set:
+                return True
+
+        return False
+
+    def explain(
+        self,
+        text: str,
+        top_k: int = 20,
+        filter_special: bool = True,
+        filter_stopwords: bool = True,
+        filter_subwords: bool = True,
+        min_token_length: int = 2,
+    ) -> List[Tuple[str, float]]:
         """
         Get top weighted terms for a text.
 
         Args:
             text: Input text
             top_k: Number of top terms to return
+            filter_special: Filter special tokens like [CLS], [unused123]
+            filter_stopwords: Filter common English stopwords
+            filter_subwords: Filter ##-prefixed subword tokens
+            min_token_length: Minimum token length to include
 
         Returns:
-            List of (term, weight) tuples
+            List of (term, weight) tuples, filtered and sorted by weight
         """
+        from src.utils import load_stopwords
+
         vectors = self.transform([text])
         weights = vectors[0]
 
-        # Get top-k terms
-        values, indices = torch.topk(weights, top_k)
+        # Load stopwords once if filtering
+        stopwords_set = load_stopwords() if filter_stopwords else None
+
+        # Get more candidates than needed to account for filtering
+        num_candidates = min(top_k * 5, weights.shape[0])
+        values, indices = torch.topk(weights, num_candidates)
 
         results = []
         for idx, val in zip(indices.tolist(), values.tolist()):
-            if val > 0:
-                token = self.tokenizer.decode([idx]).strip()
-                results.append((token, val))
+            if val <= 0:
+                continue
+
+            token = self.tokenizer.decode([idx]).strip()
+
+            # Apply filtering
+            if self._should_filter_token(
+                token_id=idx,
+                token_str=token,
+                filter_special=filter_special,
+                filter_stopwords=filter_stopwords,
+                filter_subwords=filter_subwords,
+                min_length=min_token_length,
+                stopwords_set=stopwords_set,
+            ):
+                continue
+
+            results.append((token, val))
+
+            # Stop once we have enough
+            if len(results) >= top_k:
+                break
 
         return results
 
-    def print_explanation(self, text: str, top_k: int = 20):
+    def print_explanation(
+        self,
+        text: str,
+        top_k: int = 20,
+        filter_special: bool = True,
+        filter_stopwords: bool = True,
+        filter_subwords: bool = True,
+    ):
         """
         Pretty-print explanation for a text.
 
         Args:
             text: Input text
             top_k: Number of top terms to show
+            filter_special: Filter special tokens like [CLS], [unused123]
+            filter_stopwords: Filter common English stopwords
+            filter_subwords: Filter ##-prefixed subword tokens
         """
         # Get prediction
         prob = self.predict_proba([text])[0]
@@ -445,7 +557,12 @@ class SPLADEClassifier:
         print(f"\nTop {top_k} terms driving this prediction:")
         print("-" * 40)
 
-        terms = self.explain(text, top_k)
+        terms = self.explain(
+            text, top_k,
+            filter_special=filter_special,
+            filter_stopwords=filter_stopwords,
+            filter_subwords=filter_subwords,
+        )
         for term, weight in terms:
             bar = "█" * int(weight * 10)
             print(f"  {term:<15} {weight:.3f} {bar}")
@@ -463,26 +580,66 @@ class SPLADEClassifier:
                 "flops_lambda": self.flops_lambda,
                 "num_labels": self.num_labels,
                 "class_names": self.class_names,
-            }
+                "mlm_pretrained": self.model.mlm_pretrained,
+            },
+            "version": 2,
         }, path)
 
-    def load(self, path: str):
-        """Load model from file."""
-        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+    @classmethod
+    def load(cls, path: str, device: Optional[str] = None) -> "SPLADEClassifier":
+        """
+        Load a saved model from file.
 
-        # Load config first to get num_labels
-        if "config" in checkpoint:
-            config = checkpoint["config"]
-            self.max_length = config.get("max_length", self.max_length)
-            self.batch_size = config.get("batch_size", self.batch_size)
-            self.num_labels = config.get("num_labels", self.num_labels)
-            self.class_names = config.get("class_names", self.class_names)
+        Args:
+            path: Path to saved model file
+            device: Device to load model to (auto-detected if None)
 
-            # Reinitialize model if num_labels changed
-            saved_num_labels = config.get("num_labels", 1)
-            if saved_num_labels != self.model.classifier.out_features:
-                self.model = _SpladeModule(
-                    self.model_name, self.max_length, num_labels=saved_num_labels
-                ).to(self.device)
+        Returns:
+            Loaded SPLADEClassifier instance
+        """
+        checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+        config = checkpoint["config"]
+        mlm_pretrained = config.get("mlm_pretrained", False)
 
-        self.model.load_state_dict(checkpoint["model_state_dict"])
+        # Create instance without reloading MLM weights (use saved weights)
+        clf = cls(
+            model_name=config["model_name"],
+            max_length=config["max_length"],
+            batch_size=config["batch_size"],
+            learning_rate=config["learning_rate"],
+            flops_lambda=config["flops_lambda"],
+            num_labels=config["num_labels"],
+            class_names=config.get("class_names"),
+            load_mlm_weights=False,
+        )
+
+        # Load saved weights
+        clf.model.load_state_dict(checkpoint["model_state_dict"])
+        clf.model.mlm_pretrained = mlm_pretrained
+
+        if device:
+            clf.device = device
+        clf.model.to(clf.device)
+
+        return clf
+
+    def diagnose_mlm_head(self) -> Dict[str, Any]:
+        """
+        Check if the MLM head has pretrained weights.
+
+        Returns:
+            Dict with 'likely_pretrained' bool and weight statistics
+        """
+        vocab_proj_weight = self.model.vocab_projector.weight.data
+
+        stats = {
+            "mean": vocab_proj_weight.mean().item(),
+            "std": vocab_proj_weight.std().item(),
+            "mlm_pretrained_flag": getattr(self.model, 'mlm_pretrained', None),
+        }
+
+        # Pretrained has std ~0.047, random has std ~0.021
+        stats["likely_pretrained"] = stats["std"] > 0.035 and abs(stats["mean"]) > 0.01
+
+        return stats
+

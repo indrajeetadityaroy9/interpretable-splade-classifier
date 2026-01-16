@@ -1,5 +1,10 @@
 """
-Triton kernels for SPLADE operations.
+GPU kernels for SPLADE operations.
+
+Backend Priority:
+1. CUDA C++ kernels (fastest, requires compilation)
+2. Triton kernels (fast, JIT compiled)
+3. PyTorch fallback (always available)
 
 Provides fused implementations of:
 - Masked SPLADE aggregation: log1p(relu(x)) * mask + max_pool
@@ -16,7 +21,19 @@ Hardware Assumptions:
 """
 
 import torch
-from typing import Optional
+from typing import Optional, Literal
+
+# CUDA C++ kernels availability check
+try:
+    from .cuda import (
+        CUDA_AVAILABLE as _CUDA_AVAILABLE,
+        splade_aggregate_cuda,
+        flops_reg_cuda,
+    )
+except ImportError:
+    _CUDA_AVAILABLE = False
+    splade_aggregate_cuda = None
+    flops_reg_cuda = None
 
 # Triton availability check
 try:
@@ -79,13 +96,11 @@ if _TRITON_AVAILABLE:
 
             # Skip if masked out (attention_mask == 0)
             if attn_mask > 0:
-                # Load logits for this (batch, seq, vocab_block)
                 logits_offset = (batch_idx * logits_batch_stride +
                                seq_idx * logits_seq_stride +
                                vocab_offsets)
                 logits = tl.load(logits_ptr + logits_offset, mask=vocab_mask, other=0.0)
 
-                # Fused log1p(relu(logits))
                 logits_relu = tl.maximum(logits, 0.0)
                 weights = tl.log(1.0 + logits_relu)
 
@@ -93,7 +108,8 @@ if _TRITON_AVAILABLE:
                 max_vals = tl.maximum(max_vals, weights)
 
         # Handle case where all positions were masked (set to 0 instead of -inf)
-        max_vals = tl.where(max_vals == -float('inf'), 0.0, max_vals)
+        # Use comparison instead of equality check for floating-point robustness
+        max_vals = tl.where(max_vals < -1e30, 0.0, max_vals)
 
         # Store output
         output_offset = batch_idx * output_batch_stride + vocab_offsets
@@ -276,32 +292,77 @@ def flops_regularization_pytorch(activations: torch.Tensor) -> torch.Tensor:
 
 
 # =============================================================================
-# Unified Interface with Automatic Fallback
+# Unified Interface with Automatic Backend Selection
 # =============================================================================
+
+# Backend type alias
+Backend = Literal["auto", "cuda", "triton", "pytorch"]
+
+
+def _select_backend(
+    tensor: torch.Tensor,
+    backend: Backend = "auto",
+    required_dims: int = 2,
+) -> str:
+    """
+    Select the best available backend for a given tensor.
+
+    Priority: cuda > triton > pytorch
+
+    Args:
+        tensor: Input tensor to check compatibility
+        backend: Requested backend ("auto", "cuda", "triton", "pytorch")
+        required_dims: Required number of dimensions
+
+    Returns:
+        Selected backend name
+    """
+    if backend != "auto":
+        return backend
+
+    # Check tensor properties
+    is_cuda = tensor.is_cuda
+    is_contiguous = tensor.is_contiguous()
+    correct_dims = tensor.dim() == required_dims
+
+    # Priority: CUDA C++ > Triton > PyTorch
+    if _CUDA_AVAILABLE and is_cuda and is_contiguous and correct_dims:
+        return "cuda"
+    elif _TRITON_AVAILABLE and is_cuda and is_contiguous and correct_dims:
+        return "triton"
+    else:
+        return "pytorch"
+
 
 def splade_aggregate(
     logits: torch.Tensor,
     attention_mask: torch.Tensor,
-    use_triton: Optional[bool] = None
+    backend: Backend = "auto",
+    use_triton: Optional[bool] = None,  # Deprecated, use backend instead
 ) -> torch.Tensor:
     """
     Fused SPLADE aggregation with automatic backend selection.
 
+    Backend Priority: cuda > triton > pytorch
+
     Args:
         logits: MLM logits [batch, seq, vocab]
         attention_mask: Attention mask [batch, seq]
-        use_triton: Force Triton (True), PyTorch (False), or auto (None)
+        backend: Backend to use ("auto", "cuda", "triton", "pytorch")
+        use_triton: Deprecated. Use backend="triton" instead.
 
     Returns:
         Document vectors [batch, vocab]
     """
-    if use_triton is None:
-        use_triton = (_TRITON_AVAILABLE and
-                     logits.is_cuda and
-                     logits.is_contiguous() and
-                     logits.dim() == 3)
+    # Handle deprecated use_triton parameter
+    if use_triton is not None:
+        backend = "triton" if use_triton else "pytorch"
 
-    if use_triton:
+    selected = _select_backend(logits, backend, required_dims=3)
+
+    if selected == "cuda":
+        return splade_aggregate_cuda(logits, attention_mask)
+    elif selected == "triton":
         return splade_aggregate_triton(logits, attention_mask)
     else:
         return splade_aggregate_pytorch(logits, attention_mask)
@@ -309,25 +370,33 @@ def splade_aggregate(
 
 def flops_reg(
     activations: torch.Tensor,
-    use_triton: Optional[bool] = None
+    backend: Backend = "auto",
+    use_triton: Optional[bool] = None,  # Deprecated, use backend instead
 ) -> torch.Tensor:
     """
     FLOPS regularization with automatic backend selection.
 
+    Backend Priority: cuda > triton > pytorch
+
     Args:
         activations: Activation tensor [batch, vocab]
-        use_triton: Force Triton (True), PyTorch (False), or auto (None)
+        backend: Backend to use ("auto", "cuda", "triton", "pytorch")
+        use_triton: Deprecated. Use backend="triton" instead.
 
     Returns:
         Scalar loss
     """
-    if use_triton is None:
-        use_triton = (_TRITON_AVAILABLE and
-                     activations.is_cuda and
-                     activations.is_contiguous() and
-                     activations.dim() == 2)
+    # Handle deprecated use_triton parameter
+    if use_triton is not None:
+        backend = "triton" if use_triton else "pytorch"
 
-    if use_triton:
+    selected = _select_backend(activations, backend, required_dims=2)
+
+    if selected == "cuda":
+        return flops_reg_cuda(activations)
+    elif selected == "triton":
         return flops_regularization_triton(activations)
     else:
         return flops_regularization_pytorch(activations)
+
+

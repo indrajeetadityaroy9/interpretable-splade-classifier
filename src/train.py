@@ -23,7 +23,6 @@ def train(args):
     """Train SPLADE classifier using the sklearn-style API."""
     print("Loading data...")
 
-    # Validate inputs
     has_local, has_hf = validate_data_sources(
         args.train_path, args.test_path, args.dataset,
         raise_on_error=False, print_error=True
@@ -31,7 +30,6 @@ def train(args):
     if not has_local and not has_hf:
         return
 
-    # Load data as raw texts and labels
     if has_local:
         print(f"  Source: Local files")
         print(f"  Train: {args.train_path}")
@@ -43,7 +41,7 @@ def train(args):
         test_texts, test_labels, test_meta = load_classification_data(
             file_path=args.test_path
         )
-        num_labels = train_meta.get('num_labels', max(train_labels) + 1)
+        num_classes = train_meta.get('num_labels', max(train_labels) + 1)
         class_names = None
     else:
         print(f"  Source: HuggingFace dataset '{args.dataset}'")
@@ -56,16 +54,19 @@ def train(args):
             dataset=args.dataset,
             split="test"
         )
-        num_labels = train_meta['num_labels']
+        num_classes = train_meta['num_labels']
         class_names = train_meta.get('class_names')
+
+    # For binary classification (2 classes), use num_labels=1 (BCE loss)
+    # For multi-class, use num_labels=num_classes (CrossEntropy loss)
+    num_labels = 1 if num_classes == 2 else num_classes
 
     print(f"  Train samples: {len(train_texts)}")
     print(f"  Test samples: {len(test_texts)}")
-    print(f"  Num labels: {num_labels}")
+    print(f"  Num classes: {num_classes}")
     if class_names:
         print(f"  Classes: {class_names}")
 
-    # Create and train classifier
     clf = SPLADEClassifier(
         num_labels=num_labels,
         class_names=class_names,
@@ -82,13 +83,11 @@ def train(args):
 
     print(f"\nTraining finished in {time.time() - start_time:.2f}s")
 
-    # Evaluate
     accuracy = clf.score(test_texts, test_labels)
-    sparsity = clf.get_sparsity(test_texts[:100])  # Sample for speed
+    sparsity = clf.get_sparsity(test_texts)
     print(f"Test Accuracy: {accuracy:.4f}")
     print(f"Sparsity: {sparsity:.2f}%")
 
-    # Save model
     model_path = os.path.join(args.output_dir, 'model.pth')
     os.makedirs(args.output_dir, exist_ok=True)
     clf.save(model_path)

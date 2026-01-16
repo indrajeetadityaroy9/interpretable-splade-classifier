@@ -4,9 +4,23 @@ A fast, interpretable sparse text classifier with an sklearn-compatible API. Bui
 ## Features
 
 - **Sklearn-compatible API** - `fit()`, `predict()`, `transform()` just like scikit-learn
-- **Interpretable** - See exactly which terms drive each prediction
-- **Sparse & Fast** - 98%+ sparsity with Triton-accelerated inference (10x speedup)
-- **State-of-the-art** - Outperforms TF-IDF baselines by 5+ percentage points
+- **Interpretable** - See exactly which vocabulary terms drive each prediction
+- **Sparse & Fast** - 78%+ sparsity with CUDA/Triton-accelerated inference (7.4x speedup)
+- **Better than TF-IDF** - Outperforms traditional sparse baselines while maintaining interpretability
+
+## Installation
+
+```bash
+# Standard install (auto-builds CUDA kernels if nvcc available)
+pip install .
+
+# With Triton acceleration
+pip install ".[gpu]"
+
+# Development install
+pip install -e . --no-build-isolation
+make build-cuda  # Build CUDA kernels
+```
 
 ## Quick Start
 
@@ -26,16 +40,19 @@ clf.print_explanation("This movie was fantastic!")
 
 ## Benchmark Results
 
-Evaluated on AG News (4-class news classification) with 2,000 training samples:
+Evaluated on AG News (4-class news classification) with 2,000 training samples (preliminary results):
 
-| Model | Accuracy | F1 Score | Sparsity | Train Time |
-|-------|----------|----------|----------|------------|
-| **SPLADE (Ours)** | **90.1%** | **0.901** | 78.1% | 13.5s |
-| TF-IDF + LogReg | 85.0% | 0.848 | 99.7% | 4.9s |
+| Model | Accuracy | F1 Score | Sparsity | Interpretable |
+|-------|----------|----------|----------|---------------|
+| **SPLADE (Ours)** | **90.1%** | **0.901** | 78.1% | Yes |
+| TF-IDF + LogReg | 85.0% | 0.848 | 99.7% | Yes |
+| BERT-base (reference) | ~94% | ~0.94 | N/A | No |
 
-**+5.1% accuracy improvement** over traditional TF-IDF baseline.
+**Key tradeoffs:**
+- SPLADE vs TF-IDF: +5.1% accuracy while remaining interpretable
+- SPLADE vs BERT: ~4% lower accuracy, but provides term-level explanations
 
-See `notebooks/splade_sklearn_benchmark.ipynb` for the full comparison.
+See `notebooks/splade_sklearn_benchmark.ipynb` for the comparison methodology.
 
 ## API Reference
 
@@ -86,31 +103,19 @@ The resulting vectors are:
 - **Interpretable**: Each dimension = vocabulary term weight
 - **Expandable**: Semantically related terms get non-zero weights
 
-## Advanced: Sparse Autoencoder Analysis
-
-For deeper interpretability, train a Sparse Autoencoder on SPLADE vectors:
-
-```bash
-# Extract vectors
-python -m src.extract_vectors --model_path models/model.pth
-
-# Train SAE
-python -m src.train_sae --vectors_path outputs/vectors.pt --epochs 10
-
-# Analyze features
-python -m src.analyze_sae --sae_path outputs/sae/sae_best.pt
-```
-
-This decomposes polysemantic SPLADE dimensions into monosemantic features.
-
 ## Performance Optimization
 
-Triton kernels provide significant speedup on GPU inference:
+GPU kernels provide significant speedup (3-tier backend: CUDA C++ → Triton → PyTorch):
 
-| Operation | PyTorch | Triton | Speedup |
-|-----------|---------|--------|---------|
-| SPLADE Aggregation | 1.29ms | 0.12ms | **10.5x** |
-| TopK Activation (SAE) | 0.45ms | 0.15ms | **3x** |
+| Backend | SPLADE Aggregation | Speedup |
+|---------|-------------------|---------|
+| PyTorch (baseline) | 1.28 ms | 1.0x |
+| Triton | 0.22 ms | 5.9x |
+| **CUDA C++** | **0.17 ms** | **7.4x** |
 
-Triton is used automatically during inference when available (requires CUDA).
+*Measured on NVIDIA H100. Backend is auto-selected (best available).*
 
+```bash
+# Check available backends
+python -c "from src.ops import get_backend_info; print(get_backend_info())"
+```

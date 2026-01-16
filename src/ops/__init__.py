@@ -1,28 +1,36 @@
 """
-Optimized GPU operations for SPLADE and SAE.
+Optimized GPU operations for SPLADE.
 
-Provides Triton-accelerated implementations with automatic PyTorch fallback.
+Backend Priority:
+1. CUDA C++ kernels (fastest, requires compilation)
+2. Triton kernels (fast, JIT compiled)
+3. PyTorch fallback (always available)
 
 Usage:
-    from src.ops import splade_aggregate, topk_activation
+    from src.ops import splade_aggregate, flops_reg
 
-    # Automatic backend selection (Triton on CUDA, PyTorch otherwise)
+    # Automatic backend selection (best available)
     doc_vectors = splade_aggregate(logits, attention_mask)
 
     # Force specific backend
-    doc_vectors = splade_aggregate(logits, attention_mask, use_triton=False)
+    doc_vectors = splade_aggregate(logits, attention_mask, backend="pytorch")
 
 Supported Operations:
     - splade_aggregate: Fused log1p + relu + mask + max_pool
     - flops_reg: FLOPS regularization loss
-    - topk_activation: TopK activation with scatter
 
 Hardware Requirements:
     - CUDA compute capability >= 7.0 (Volta or newer)
-    - Triton >= 2.0
+    - For CUDA kernels: Build with setup_cuda.py
+    - For Triton: pip install triton>=2.0
 """
 
-import torch
+# Check CUDA C++ kernels availability
+try:
+    from .cuda import CUDA_AVAILABLE, CUDA_INFO
+except ImportError:
+    CUDA_AVAILABLE = False
+    CUDA_INFO = None
 
 # Check Triton availability
 try:
@@ -35,13 +43,11 @@ except ImportError:
 
 # Import public API
 from .splade_kernels import splade_aggregate, flops_reg
-from .sae_kernels import topk_activation
 
 
 __all__ = [
     "splade_aggregate",
     "flops_reg",
-    "topk_activation",
+    "CUDA_AVAILABLE",
     "TRITON_AVAILABLE",
-    "TRITON_VERSION",
 ]

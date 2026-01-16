@@ -19,6 +19,7 @@ htmlcov/
 
 # Jupyter
 .ipynb_checkpoints/
+notebooks/executed_*.ipynb
 
 # Model artifacts and checkpoints
 models/
@@ -58,3 +59,30 @@ tensorboard/
 .vscode/
 .idea/
 .DS_Store
+
+# Egg info and dist
+*.egg-info/
+dist/
+build/
+
+# CUDA compiled extensions
+*.so
+src/ops/cuda/*.so
+splade_cuda_kernels*.so
+
+# Vectors and embeddings
+vectors/
+embeddings/
+*.npy
+*.npz
+
+# Temporary files
+tmp/
+tmp_bert_*/
+*.tmp
+
+# Results
+results/
+
+# NLTK data
+nltk_data/

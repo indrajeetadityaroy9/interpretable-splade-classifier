@@ -6,6 +6,7 @@ Provides common utilities for:
 - Text processing (tokenization, stopwords)
 - Device management
 - Data source validation
+- Statistical analysis (confidence intervals, significance tests)
 """
 
 import random
@@ -14,6 +15,15 @@ import torch
 
 from .text import load_stopwords, simple_tokenizer
 from .common import get_device, validate_data_sources
+from .statistics import (
+    StatisticalResult,
+    McNemarResult,
+    bootstrap_ci,
+    mcnemar_test,
+    paired_t_test,
+    aggregate_results,
+    effect_size_cohens_d,
+)
 
 
 def set_seed(seed: int = 42):
@@ -34,10 +44,15 @@ def set_seed(seed: int = 42):
 
 __all__ = [
     "set_seed",
-    # Text processing
     "load_stopwords",
     "simple_tokenizer",
-    # Common utilities
     "get_device",
     "validate_data_sources",
+    "StatisticalResult",
+    "McNemarResult",
+    "bootstrap_ci",
+    "mcnemar_test",
+    "paired_t_test",
+    "aggregate_results",
+    "effect_size_cohens_d",
 ]
