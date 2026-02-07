@@ -1,81 +1,35 @@
-# Interpretable SPLADE Classifier
+# Interpretable SPLADE Classifier: Sparse Lexical Representations for Faithful Text Classification
 
-Canonical research pipeline for SPLADE-based text classification and faithfulness benchmarking.
+Deep learning classifiers often suffer from a lack of inherent interpretability, relying on post-hoc explainers that may fail to capture the true model logic. By adapting the SPLADE v2 architecture—originally designed for information retrieval—this repository implements a classifier that is **interpretable by design**. Through sparse vocabulary activations and document-frequency (DF) weighted regularization, the model produces human-readable lexical explanations that are directly tied to the classification decision. To validate these explanations, the **F-Fidelity protocol** is employed, ensuring that faithfulness metrics are measured on a model distribution resilient to OOD artifacts.
 
-## Canonical Execution Paths
+---
 
-- Training: `python -m scripts.train`
-- Evaluation: `python -m scripts.eval`
-- Inference API: `src/models/classifier.py::SPLADEClassifier`
+1.  **Standardized SPLADE v3**: Implementation of the SPLADE v3 architecture with Dynamic ReLU (DReLU) for superior sparsity-efficiency trade-offs.
+2.  **DF-FLOPS Regularization**: Introduction of Document-Frequency weighted FLOPS regularization to control representation sparsity while preserving informative, rare terms.
+3.  **F-Fidelity Protocol**: Implementation of the F-Fidelity fine-tuning procedure ([arXiv:2410.02970](https://arxiv.org/abs/2410.02970)) to mitigate masking bias in faithfulness evaluation.
 
-The codebase is intentionally single-path:
+---
 
-- Dataset: SST-2 only
-- Training orchestration: one script
-- Evaluation orchestration: one script (single-seed full benchmark)
-- Inference: `predict`, `predict_proba`, `explain`
+### SPLADE Aggregation
+The model computes sparse document vectors $\mathbf{s} \in \mathbb{R}^{|V|}$ by aggregating BERT-derived token logits over the sequence length $L$:
+$$s_j = \max_{i \in [1, L]} \log(1 + \text{ReLU}(w_{ij} - \theta_j))$$
+where $w_{ij}$ is the logit for the $j$-th vocabulary term at the $i$-th sequence position and $\theta_j$ is the learnable activation threshold.
 
-## Install
+### Regularization Objectives
+The training process minimizes a joint objective $\mathcal{L} = \mathcal{L}_{CE} + \lambda \mathcal{L}_{sparse}$:
+- **FLOPS**: $\mathcal{L}_{FLOPS} = \sum_{j} \bar{a}_j^2$, where $\bar{a}_j$ is the mean activation of term $j$ across the batch.
+- **DF-FLOPS**: Weights the penalty by document frequency to encourage the selection of discriminative lexical features.
 
-```bash
-pip install -e .
-```
+Implements evaluation protocol to measure explanation **Faithfulness**:
 
-## Train
+- **Normalized AOPC (NAOPC)**: Per-example normalized Area Over the Perturbation Curve using beam-search bounds to estimate the theoretical max/min drop.
+- **Soft Metrics**: Monte Carlo estimates of Comprehensiveness and Sufficiency using probabilistic masking to avoid OOD artifacts ([arXiv:2305.10496](https://arxiv.org/abs/2305.10496)).
+- **Adversarial Sensitivity**: Measures the stability of explanation rankings under synonym substitution and character-level perturbations using the Kendall-Tau-$\hat{h}$ metric.
+- **Subword-to-Word Alignment**: A robust normalization layer that maps subword attributions to whitespace-delimited words for fair comparison.
 
-```bash
-python -m scripts.train \
-  --train-samples 2000 \
-  --test-samples 200 \
-  --epochs 2 \
-  --batch-size 64 \
-  --seed 42
-```
+## References
 
-## Evaluate
-
-```bash
-python -m scripts.eval \
-  --train-samples 2000 \
-  --test-samples 200 \
-  --epochs 2 \
-  --batch-size 32 \
-  --seed 42
-```
-
-Evaluation includes:
-
-- SPLADE native explanations
-- Attention / LIME / Integrated Gradients adapter baselines on the same model
-- ERASER-family metrics, normalized AOPC, soft perturbation metrics
-- F-Fidelity fine-tuned copy metrics
-- Adversarial sensitivity metrics
-
-## Inference API
-
-```python
-from src.models.classifier import SPLADEClassifier
-
-model = SPLADEClassifier(num_labels=2)
-model.fit(train_texts, train_labels, epochs=2)
-
-predictions = model.predict(test_texts)
-probabilities = model.predict_proba(test_texts)
-explanations = model.explain("This movie was fantastic", top_k=10)
-sparse_vectors = model.transform(test_texts)
-```
-
-## Core Modules
-
-- `scripts/train.py`: canonical training entrypoint
-- `scripts/eval.py`: canonical evaluation entrypoint
-- `src/models/classifier.py`: model, training loop, inference API
-- `src/models/components.py`: SPLADE aggregation and Triton backward kernel
-- `src/training/losses.py`: DF-FLOPS regularization
-- `src/training/optim.py`: LR schedule, AGC, early stopping
-- `src/training/finetune.py`: F-Fidelity fine-tuning copy
-- `src/evaluation/faithfulness.py`: faithfulness metrics
-- `src/evaluation/adversarial.py`: adversarial sensitivity metrics
-- `src/evaluation/benchmark.py`: benchmark config, execution, result tables
-- `src/baselines/splade_adapters.py`: adapter baselines on the same model
-- `src/data/loader.py`: SST-2 loader
+- **SPLADE v2**: Formal et al. (2021). [arXiv:2109.10086](https://arxiv.org/abs/2109.10086)
+- **F-Fidelity**: [arXiv:2410.02970](https://arxiv.org/abs/2410.02970)
+- **OOD Artifacts in Faithfulness**: [arXiv:2308.14272](https://arxiv.org/abs/2308.14272)
+- **ERASER Benchmark**: [arXiv:1911.03429](https://arxiv.org/abs/1911.03429)
