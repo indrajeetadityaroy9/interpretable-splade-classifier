@@ -1,28 +1,19 @@
-"""Adversarial sensitivity metrics (arXiv:2409.17774).
+"""Adversarial sensitivity metrics for explanation rankings."""
 
-Supports multiple attack strategies: WordNet synonyms, TextFooler-style
-importance-based replacement, and character-level perturbations.
-Uses generalized Kendall tau-hat for incomplete rankings.
-"""
-
-import random as _random_module
+import random
 import string
 from functools import lru_cache
 from typing import Callable, Protocol, runtime_checkable
 
-import numpy as np
-from nltk.corpus import wordnet as wn
+import numpy
+from nltk.corpus import wordnet
 
 from src.evaluation.faithfulness import Predictor
 
 
-# ---------------------------------------------------------------------------
-# Attack strategies
-# ---------------------------------------------------------------------------
-
 @runtime_checkable
 class AttackStrategy(Protocol):
-    def attack(self, text: str, rng: _random_module.Random) -> str: ...
+    def attack(self, text: str, rng: random.Random) -> str: ...
 
 
 class WordNetAttack:
@@ -31,71 +22,67 @@ class WordNetAttack:
     def __init__(self, max_changes: int = 3):
         self.max_changes = max_changes
 
-    def attack(self, text: str, rng: _random_module.Random) -> str:
+    def attack(self, text: str, rng: random.Random) -> str:
         words = text.split()
-        modified_words, change_count = list(words), 0
+        modified_words = list(words)
+        change_count = 0
         indices = list(range(len(words)))
         rng.shuffle(indices)
-        for idx in indices:
+        for index in indices:
             if change_count >= self.max_changes:
                 break
-            word = words[idx].lower().strip('.,!?;:"\'-')
-            syns = _get_wordnet_synonyms(word)
-            if syns:
-                replacement = rng.choice(syns)
-                if words[idx][0].isupper():
+            source = words[index].lower().strip('.,!?;:"\'-')
+            synonyms = _get_wordnet_synonyms(source)
+            if synonyms:
+                replacement = rng.choice(synonyms)
+                if words[index][0].isupper():
                     replacement = replacement.capitalize()
-                modified_words[idx] = replacement
+                modified_words[index] = replacement
                 change_count += 1
-        return ' '.join(w for w in modified_words if w)
+        return " ".join(word for word in modified_words if word)
 
 
 class TextFoolerAttack:
-    """TextFooler-style importance-based word replacement (Jin et al. 2020).
-
-    Ranks words by leave-one-out confidence drop, then replaces the most
-    important words with WordNet synonyms (approximating counter-fitted embeddings).
-    """
+    """Leave-one-out ranking followed by synonym replacement."""
 
     def __init__(self, model: Predictor, max_changes: int = 3):
         self.model = model
         self.max_changes = max_changes
 
-    def attack(self, text: str, rng: _random_module.Random) -> str:
+    def attack(self, text: str, rng: random.Random) -> str:
         words = text.split()
         if not words:
             return text
 
-        orig_proba = self.model.predict_proba([text])[0]
-        pred_class = int(np.argmax(orig_proba))
-        orig_conf = orig_proba[pred_class]
+        original_probabilities = self.model.predict_proba([text])[0]
+        predicted_class = int(numpy.argmax(original_probabilities))
+        original_confidence = original_probabilities[predicted_class]
 
-        # Rank words by importance (leave-one-out confidence drop)
         importance = []
-        for i in range(len(words)):
-            reduced = ' '.join(words[:i] + words[i+1:])
-            if not reduced.strip():
-                importance.append((i, 0.0))
+        for index in range(len(words)):
+            reduced_text = " ".join(words[:index] + words[index + 1 :])
+            if not reduced_text.strip():
+                importance.append((index, 0.0))
                 continue
-            reduced_conf = self.model.predict_proba([reduced])[0][pred_class]
-            importance.append((i, orig_conf - reduced_conf))
-        importance.sort(key=lambda x: x[1], reverse=True)
+            reduced_confidence = self.model.predict_proba([reduced_text])[0][predicted_class]
+            importance.append((index, original_confidence - reduced_confidence))
+        importance.sort(key=lambda pair: pair[1], reverse=True)
 
         modified_words = list(words)
         change_count = 0
-        for idx, _ in importance:
+        for index, _ in importance:
             if change_count >= self.max_changes:
                 break
-            word = words[idx].lower().strip('.,!?;:"\'-')
-            syns = _get_wordnet_synonyms(word)
-            if syns:
-                replacement = rng.choice(syns)
-                if words[idx][0].isupper():
+            source = words[index].lower().strip('.,!?;:"\'-')
+            synonyms = _get_wordnet_synonyms(source)
+            if synonyms:
+                replacement = rng.choice(synonyms)
+                if words[index][0].isupper():
                     replacement = replacement.capitalize()
-                modified_words[idx] = replacement
+                modified_words[index] = replacement
                 change_count += 1
 
-        return ' '.join(w for w in modified_words if w)
+        return " ".join(word for word in modified_words if word)
 
 
 class CharacterAttack:
@@ -104,96 +91,84 @@ class CharacterAttack:
     def __init__(self, max_changes: int = 3):
         self.max_changes = max_changes
 
-    def attack(self, text: str, rng: _random_module.Random) -> str:
+    def attack(self, text: str, rng: random.Random) -> str:
         words = text.split()
         if not words:
             return text
 
-        # Pick random words to perturb
-        eligible = [i for i, w in enumerate(words) if len(w) > 2]
+        eligible = [index for index, word in enumerate(words) if len(word) > 2]
         if not eligible:
             return text
 
         modified_words = list(words)
         indices = rng.sample(eligible, min(self.max_changes, len(eligible)))
 
-        for idx in indices:
-            word = modified_words[idx]
-            op = rng.choice(['swap', 'insert', 'delete'])
-            chars = list(word)
-            if op == 'swap' and len(chars) > 1:
-                i = rng.randint(0, len(chars) - 2)
-                chars[i], chars[i+1] = chars[i+1], chars[i]
-            elif op == 'insert':
-                i = rng.randint(0, len(chars))
-                chars.insert(i, rng.choice(string.ascii_lowercase))
-            elif op == 'delete' and len(chars) > 1:
-                i = rng.randint(0, len(chars) - 1)
-                chars.pop(i)
-            modified_words[idx] = ''.join(chars)
+        for index in indices:
+            word = modified_words[index]
+            operation = rng.choice(["swap", "insert", "delete"])
+            characters = list(word)
+            if operation == "swap" and len(characters) > 1:
+                swap_index = rng.randint(0, len(characters) - 2)
+                characters[swap_index], characters[swap_index + 1] = (
+                    characters[swap_index + 1],
+                    characters[swap_index],
+                )
+            elif operation == "insert":
+                insert_index = rng.randint(0, len(characters))
+                characters.insert(insert_index, rng.choice(string.ascii_lowercase))
+            elif operation == "delete" and len(characters) > 1:
+                delete_index = rng.randint(0, len(characters) - 1)
+                characters.pop(delete_index)
+            modified_words[index] = "".join(characters)
 
-        return ' '.join(modified_words)
+        return " ".join(modified_words)
 
-
-# ---------------------------------------------------------------------------
-# Kendall tau-hat for incomplete rankings
-# ---------------------------------------------------------------------------
 
 def _kendall_tau_hat(
     ranking_a: list[tuple[str, float]],
     ranking_b: list[tuple[str, float]],
 ) -> float:
-    """Generalized Kendall tau for incomplete rankings (tau-hat_x).
-
-    Handles disjoint elements by treating missing items as tied at the end
-    of the ranking they're absent from.
-    """
-    all_items = list(set(t.lower() for t, _ in ranking_a) | set(t.lower() for t, _ in ranking_b))
-    n = len(all_items)
-    if n < 2:
+    """Generalized Kendall tau for incomplete rankings."""
+    all_items = list({token.lower() for token, _ in ranking_a} | {token.lower() for token, _ in ranking_b})
+    item_count = len(all_items)
+    if item_count < 2:
         return 0.0
 
-    rank_a = {t.lower(): i for i, (t, _) in enumerate(ranking_a)}
-    rank_b = {t.lower(): i for i, (t, _) in enumerate(ranking_b)}
+    rank_a = {token.lower(): index for index, (token, _) in enumerate(ranking_a)}
+    rank_b = {token.lower(): index for index, (token, _) in enumerate(ranking_b)}
     default_a = len(ranking_a)
     default_b = len(ranking_b)
 
-    concordant, discordant = 0, 0
-    for i in range(n):
-        for j in range(i + 1, n):
-            ra_i = rank_a.get(all_items[i], default_a)
-            ra_j = rank_a.get(all_items[j], default_a)
-            rb_i = rank_b.get(all_items[i], default_b)
-            rb_j = rank_b.get(all_items[j], default_b)
-            diff_a = ra_i - ra_j
-            diff_b = rb_i - rb_j
+    concordant = 0
+    discordant = 0
+    for left in range(item_count):
+        for right in range(left + 1, item_count):
+            rank_a_left = rank_a.get(all_items[left], default_a)
+            rank_a_right = rank_a.get(all_items[right], default_a)
+            rank_b_left = rank_b.get(all_items[left], default_b)
+            rank_b_right = rank_b.get(all_items[right], default_b)
+            diff_a = rank_a_left - rank_a_right
+            diff_b = rank_b_left - rank_b_right
             if diff_a * diff_b > 0:
                 concordant += 1
             elif diff_a * diff_b < 0:
                 discordant += 1
+
     total = concordant + discordant
     return (concordant - discordant) / total if total > 0 else 0.0
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 @lru_cache(maxsize=4096)
 def _get_wordnet_synonyms(word: str) -> list[str]:
     """Fetch single-word synonyms from WordNet."""
     synonyms = set()
-    for syn in wn.synsets(word):
-        for lemma in syn.lemmas():
+    for synset in wordnet.synsets(word):
+        for lemma in synset.lemmas():
             name = lemma.name()
             if "_" not in name and name.lower() != word.lower():
                 synonyms.add(name.lower())
     return list(synonyms)[:20]
 
-
-# ---------------------------------------------------------------------------
-# Main metric
-# ---------------------------------------------------------------------------
 
 def compute_adversarial_sensitivity(
     model: Predictor,
@@ -205,22 +180,17 @@ def compute_adversarial_sensitivity(
     top_k: int,
     seed: int,
 ) -> dict:
-    """Measure how explanation rankings change under adversarial attack (arXiv:2409.17774).
-
-    Supports multiple attack strategies and uses generalized Kendall tau-hat
-    for incomplete rankings.
-    """
+    """Measure ranking instability under one or more attacks."""
     if attacks is None:
         attacks = [WordNetAttack(max_changes)]
 
-    rng = _random_module.Random(seed)
-    original_probas = model.predict_proba(texts)
-
-    # Filter to high-confidence examples
-    filtered = []
-    for text, orig_proba in zip(texts, original_probas):
-        if max(orig_proba) >= mcp_threshold:
-            filtered.append(text)
+    rng = random.Random(seed)
+    original_probabilities = model.predict_proba(texts)
+    filtered_texts = [
+        text
+        for text, probabilities in zip(texts, original_probabilities)
+        if max(probabilities) >= mcp_threshold
+    ]
 
     all_tau_scores = []
     per_attack_results = {}
@@ -228,20 +198,18 @@ def compute_adversarial_sensitivity(
     for attack in attacks:
         attack_name = type(attack).__name__
         tau_scores = []
-
-        for text in filtered:
-            adv_text = attack.attack(text, rng)
-            exp_orig = explainer_fn(text, top_k)
-            exp_adv = explainer_fn(adv_text, top_k)
-
-            tau = _kendall_tau_hat(exp_orig, exp_adv)
+        for text in filtered_texts:
+            adversarial_text = attack.attack(text, rng)
+            original_explanation = explainer_fn(text, top_k)
+            adversarial_explanation = explainer_fn(adversarial_text, top_k)
+            tau = _kendall_tau_hat(original_explanation, adversarial_explanation)
             tau_scores.append(tau)
 
         all_tau_scores.extend(tau_scores)
         if tau_scores:
             per_attack_results[attack_name] = {
-                "mean_tau": float(np.mean(tau_scores)),
-                "sensitivity": float(np.mean([1 - (t + 1) / 2 for t in tau_scores])),
+                "mean_tau": float(numpy.mean(tau_scores)),
+                "sensitivity": float(numpy.mean([1 - (tau + 1) / 2 for tau in tau_scores])),
             }
 
     if not all_tau_scores:
@@ -249,7 +217,7 @@ def compute_adversarial_sensitivity(
 
     sensitivity_scores = [1 - (tau + 1) / 2 for tau in all_tau_scores]
     return {
-        "adversarial_sensitivity": float(np.mean(sensitivity_scores)),
-        "mean_tau": float(np.mean(all_tau_scores)),
+        "adversarial_sensitivity": float(numpy.mean(sensitivity_scores)),
+        "mean_tau": float(numpy.mean(all_tau_scores)),
         "per_attack": per_attack_results,
     }

@@ -1,29 +1,25 @@
-"""Faithfulness metrics for interpretability evaluation."""
+"""Faithfulness metrics for token attribution methods."""
 
 from collections import Counter
 from typing import Protocol
 
-import numpy as np
+import numpy
 
 
 class UnigramSampler:
-    """Sample replacement tokens from unigram distribution (arXiv:2308.14272).
-
-    Preserving the token distribution avoids OOD artifacts when evaluating
-    comprehensiveness with filler tokens.
-    """
+    """Sample replacement words from a corpus unigram distribution."""
 
     def __init__(self, texts: list[str], seed: int):
         counts: Counter[str] = Counter()
         for text in texts:
             for word in text.lower().split():
-                w = word.strip('.,!?;:"\'-')
-                if w:
-                    counts[w] += 1
+                normalized_word = word.strip('.,!?;:"\'-')
+                if normalized_word:
+                    counts[normalized_word] += 1
         total = sum(counts.values())
         self.words = list(counts.keys())
-        self.probs = np.array([counts[w] / total for w in self.words])
-        self.rng = np.random.default_rng(seed)
+        self.probs = numpy.array([counts[word] / total for word in self.words])
+        self.rng = numpy.random.default_rng(seed)
 
     def sample(self) -> str:
         return str(self.rng.choice(self.words, p=self.probs))
@@ -34,16 +30,16 @@ class Predictor(Protocol):
 
 
 def _top_k_tokens(attrib: list[tuple[str, float]], k: int) -> set[str]:
-    """Select top-k tokens by weight, preserving importance ordering."""
+    """Select unique positive-weight tokens from the attribution ranking."""
     seen: set[str] = set()
     result: set[str] = set()
-    for t, w in attrib:
-        if w <= 0:
+    for token, weight in attrib:
+        if weight <= 0:
             continue
-        tl = t.lower()
-        if tl not in seen:
-            seen.add(tl)
-            result.add(tl)
+        lowered = token.lower()
+        if lowered not in seen:
+            seen.add(lowered)
+            result.add(lowered)
             if len(result) >= k:
                 break
     return result
@@ -56,104 +52,107 @@ def _mask_by_token_set(
     mode: str = "remove",
     max_fraction: float = 1.0,
 ) -> str:
-    """Mask tokens in text based on a token set."""
-    normalized = {t.lstrip("#").lower() for t in token_set}
+    """Mask selected tokens or their complement in whitespace-tokenized text."""
+    normalized_set = {token.lstrip("#").lower() for token in token_set}
     words = text.split()
     max_masks = int(len(words) * max_fraction) if max_fraction < 1.0 else len(words)
 
     if mode == "remove":
         mask_positions = [
-            i for i, w in enumerate(words)
-            if w.lower().strip('.,!?;:"\'-') in normalized
+            index
+            for index, word in enumerate(words)
+            if word.lower().strip('.,!?;:"\'-') in normalized_set
         ][:max_masks]
-    else:  # mode == "keep"
+    else:
         mask_positions = [
-            i for i, w in enumerate(words)
-            if w.lower().strip('.,!?;:"\'-') not in normalized
+            index
+            for index, word in enumerate(words)
+            if word.lower().strip('.,!?;:"\'-') not in normalized_set
         ][:max_masks]
 
     masked_words = list(words)
-    for pos in mask_positions:
-        masked_words[pos] = mask_token
-    return ' '.join(masked_words)
+    for position in mask_positions:
+        masked_words[position] = mask_token
+    return " ".join(masked_words)
 
 
 def _compute_masking_metric(
-    model: Predictor, texts: list[str],
+    model: Predictor,
+    texts: list[str],
     attributions: list[list[tuple[str, float]]],
     k_values: tuple[int, ...] | list[int],
     mask_token: str,
     mode: str,
     beta: float = 1.0,
 ) -> dict[int, float]:
-    """Shared implementation for comprehensiveness and sufficiency (batched)."""
+    """Compute confidence drop under remove/keep masking across k values."""
     results = {k: [] for k in k_values}
-    original_probas = model.predict_proba(texts)
+    original_probabilities = model.predict_proba(texts)
 
-    # Phase 1: collect all masked texts
     masked_texts = []
-    index_map = []  # (text_idx, k)
-    for text_idx, (text, attrib) in enumerate(zip(texts, attributions)):
+    index_map = []
+    for text_index, (text, attrib) in enumerate(zip(texts, attributions)):
         for k in k_values:
             top_tokens = _top_k_tokens(attrib, k)
             masked_text = _mask_by_token_set(
-                text, top_tokens, mask_token, mode=mode, max_fraction=beta,
+                text,
+                top_tokens,
+                mask_token,
+                mode=mode,
+                max_fraction=beta,
             )
             masked_texts.append(masked_text)
-            index_map.append((text_idx, k))
+            index_map.append((text_index, k))
 
-    # Phase 2: single batch call
-    if masked_texts:
-        all_probas = model.predict_proba(masked_texts)
-    else:
-        all_probas = []
+    all_probabilities = model.predict_proba(masked_texts) if masked_texts else []
 
-    # Phase 3: distribute results
-    for i, (text_idx, k) in enumerate(index_map):
-        orig_proba = original_probas[text_idx]
-        pred_class = int(np.argmax(orig_proba))
-        orig_conf = orig_proba[pred_class]
-        masked_conf = all_probas[i][pred_class]
-        results[k].append(orig_conf - masked_conf)
+    for index, (text_index, k) in enumerate(index_map):
+        original_probability = original_probabilities[text_index]
+        predicted_class = int(numpy.argmax(original_probability))
+        original_confidence = original_probability[predicted_class]
+        masked_confidence = all_probabilities[index][predicted_class]
+        results[k].append(original_confidence - masked_confidence)
 
-    return {k: float(np.mean(scores)) for k, scores in results.items()}
+    return {k: float(numpy.mean(scores)) for k, scores in results.items()}
 
 
 def compute_comprehensiveness(
-    model: Predictor, texts: list[str],
+    model: Predictor,
+    texts: list[str],
     attributions: list[list[tuple[str, float]]],
     k_values: tuple[int, ...] | list[int],
     mask_token: str,
     beta: float = 1.0,
 ) -> dict[int, float]:
-    """Prediction drop when top-k tokens removed (ERASER/F-Fidelity)."""
+    """Confidence drop after removing top-k attributed tokens."""
     return _compute_masking_metric(model, texts, attributions, k_values, mask_token, "remove", beta)
 
 
 def compute_sufficiency(
-    model: Predictor, texts: list[str],
+    model: Predictor,
+    texts: list[str],
     attributions: list[list[tuple[str, float]]],
     k_values: tuple[int, ...] | list[int],
     mask_token: str,
     beta: float = 1.0,
 ) -> dict[int, float]:
-    """How well top-k tokens alone predict output (ERASER/F-Fidelity)."""
+    """Confidence drop when keeping only top-k attributed tokens."""
     return _compute_masking_metric(model, texts, attributions, k_values, mask_token, "keep", beta)
 
 
 def compute_monotonicity(
-    model: Predictor, texts: list[str],
+    model: Predictor,
+    texts: list[str],
     attributions: list[list[tuple[str, float]]],
     steps: int,
     mask_token: str,
 ) -> float:
-    """Fraction of removal steps where confidence decreases (batched)."""
-    # Phase 1: build all masked texts
+    """Fraction of removal steps where confidence is non-increasing."""
     all_masked_texts = []
-    text_meta = []  # (text_idx, step_count)
+    text_meta = []
 
-    for text_idx, (text, attrib) in enumerate(zip(texts, attributions)):
-        tokens = [t for t, w in attrib if w > 0]
+    for text_index, (text, attrib) in enumerate(zip(texts, attributions)):
+        tokens = [token for token, weight in attrib if weight > 0]
         if not tokens:
             continue
 
@@ -162,50 +161,51 @@ def compute_monotonicity(
         removed_tokens: set[str] = set()
         step_count = 0
 
-        for i in range(0, len(tokens), step_size):
-            for t in tokens[i:i + step_size]:
-                removed_tokens.add(t.lower())
+        for index in range(0, len(tokens), step_size):
+            for token in tokens[index : index + step_size]:
+                removed_tokens.add(token.lower())
             masked_text = _mask_by_token_set(text, removed_tokens, mask_token, mode="remove")
             all_masked_texts.append(masked_text)
             step_count += 1
 
-        text_meta.append((text_idx, step_count))
+        text_meta.append((text_index, step_count))
 
     if not all_masked_texts:
         return 0.0
 
-    # Phase 2: batch calls for originals and masked texts
-    orig_texts = [texts[idx] for idx, _ in text_meta]
-    original_probas = model.predict_proba(orig_texts)
-    all_probas = model.predict_proba(all_masked_texts)
+    original_texts = [texts[index] for index, _ in text_meta]
+    original_probabilities = model.predict_proba(original_texts)
+    all_probabilities = model.predict_proba(all_masked_texts)
 
-    # Phase 3: walk sequentially to check monotonicity
-    total_monotonic, total_steps = 0, 0
-    proba_idx = 0
+    total_monotonic = 0
+    total_steps = 0
+    probability_index = 0
 
-    for meta_idx, (_, step_count) in enumerate(text_meta):
-        orig_proba = original_probas[meta_idx]
-        pred_class = int(np.argmax(orig_proba))
-        prev_conf = orig_proba[pred_class]
+    for meta_index, (_, step_count) in enumerate(text_meta):
+        original_probability = original_probabilities[meta_index]
+        predicted_class = int(numpy.argmax(original_probability))
+        previous_confidence = original_probability[predicted_class]
         for _ in range(step_count):
-            curr_conf = all_probas[proba_idx][pred_class]
-            if curr_conf <= prev_conf:
+            current_confidence = all_probabilities[probability_index][predicted_class]
+            if current_confidence <= previous_confidence:
                 total_monotonic += 1
             total_steps += 1
-            prev_conf = curr_conf
-            proba_idx += 1
+            previous_confidence = current_confidence
+            probability_index += 1
 
     return total_monotonic / total_steps if total_steps > 0 else 0.0
 
 
 def _compute_aopc_for_ordering(
-    model: Predictor, text: str, ordering: list[str], mask_token: str,
+    model: Predictor,
+    text: str,
+    ordering: list[str],
+    mask_token: str,
 ) -> float:
-    """AOPC for a given token removal ordering (batched)."""
+    """AOPC for a fixed removal ordering."""
     if not ordering:
         return 0.0
 
-    # Build all incremental-removal texts + original
     masked_texts = []
     removed_tokens: set[str] = set()
     for token in ordering:
@@ -213,50 +213,54 @@ def _compute_aopc_for_ordering(
         masked_texts.append(_mask_by_token_set(text, removed_tokens, mask_token, mode="remove"))
 
     all_texts = [text] + masked_texts
-    all_probas = model.predict_proba(all_texts)
+    all_probabilities = model.predict_proba(all_texts)
 
-    pred_class = int(np.argmax(all_probas[0]))
-    orig_conf = all_probas[0][pred_class]
-    total_drop = sum(orig_conf - all_probas[i + 1][pred_class] for i in range(len(ordering)))
+    predicted_class = int(numpy.argmax(all_probabilities[0]))
+    original_confidence = all_probabilities[0][predicted_class]
+    total_drop = sum(
+        original_confidence - all_probabilities[index + 1][predicted_class]
+        for index in range(len(ordering))
+    )
     return total_drop / len(ordering)
 
 
 def _beam_search_ordering(
-    model: Predictor, text: str, tokens: list[str],
-    beam_size: int, mask_token: str,
+    model: Predictor,
+    text: str,
+    tokens: list[str],
+    beam_size: int,
+    mask_token: str,
     maximize: bool = True,
 ) -> float:
-    """Beam search for token removal ordering (batched per step)."""
-    orig_proba = model.predict_proba([text])[0]
-    pred_class = int(np.argmax(orig_proba))
-    orig_conf = orig_proba[pred_class]
+    """Beam-search estimate of min/max AOPC ordering."""
+    original_probability = model.predict_proba([text])[0]
+    predicted_class = int(numpy.argmax(original_probability))
+    original_confidence = original_probability[predicted_class]
     beams: list[tuple[set[str], list[str], float]] = [(set(), [], 0.0)]
 
     for _ in range(len(tokens)):
         candidate_texts = []
         candidate_meta = []
 
-        for removed_set, ordering, cum_drop in beams:
+        for removed_set, ordering, cumulative_drop in beams:
             for token in tokens:
                 if token.lower() in removed_set:
                     continue
                 new_removed = removed_set | {token.lower()}
                 masked_text = _mask_by_token_set(text, new_removed, mask_token, mode="remove")
                 candidate_texts.append(masked_text)
-                candidate_meta.append((new_removed, ordering + [token], cum_drop))
+                candidate_meta.append((new_removed, ordering + [token], cumulative_drop))
 
         if not candidate_texts:
             break
 
-        # Single batch call per step
-        all_probas = model.predict_proba(candidate_texts)
-
+        all_probabilities = model.predict_proba(candidate_texts)
         candidates = []
-        for i, (new_removed, new_ordering, cum_drop) in enumerate(candidate_meta):
-            masked_conf = all_probas[i][pred_class]
-            candidates.append((new_removed, new_ordering, cum_drop + orig_conf - masked_conf))
+        for index, (new_removed, new_ordering, cumulative_drop) in enumerate(candidate_meta):
+            masked_confidence = all_probabilities[index][predicted_class]
+            candidates.append((new_removed, new_ordering, cumulative_drop + original_confidence - masked_confidence))
 
-        candidates.sort(key=lambda x: x[2], reverse=maximize)
+        candidates.sort(key=lambda candidate: candidate[2], reverse=maximize)
         beams = candidates[:beam_size]
         if not beams:
             break
@@ -265,111 +269,92 @@ def _beam_search_ordering(
 
 
 def compute_normalized_aopc(
-    model: Predictor, texts: list[str],
+    model: Predictor,
+    texts: list[str],
     attributions: list[list[tuple[str, float]]],
     k_max: int,
     beam_size: int,
     mask_token: str,
 ) -> dict[str, float]:
-    """Normalized AOPC per Eq 8 of arXiv:2408.08137 (ACL 2025).
-
-    Per-example normalization: NAOPC = mean_x[(AOPC_x - lower_x) / (upper_x - lower_x)]
-    Both bounds use beam search (maximize=True for upper, maximize=False for lower).
-    """
+    """Compute normalized AOPC from per-example beam-search bounds."""
     naopc_scores = []
-    aopc_scores, lower_scores, upper_scores = [], [], []
+    aopc_scores = []
+    lower_scores = []
+    upper_scores = []
 
     for text, attrib in zip(texts, attributions):
-        # Deduplicate by lowercase (masking operates on lowercased token sets)
         seen: set[str] = set()
         tokens = []
-        for t, w in attrib:
-            if w > 0 and t.lower() not in seen:
-                seen.add(t.lower())
-                tokens.append(t)
+        for token, weight in attrib:
+            if weight > 0 and token.lower() not in seen:
+                seen.add(token.lower())
+                tokens.append(token)
                 if len(tokens) >= k_max:
                     break
         if len(tokens) < 2:
             continue
-        token_set = set(tokens)
-        attr_ordering = [t for t, _ in attrib if t in token_set]
-        aopc_x = _compute_aopc_for_ordering(model, text, attr_ordering, mask_token)
 
-        # Lower bound: beam search for MINIMUM drop ordering
-        lower_x = _beam_search_ordering(
-            model, text, tokens, beam_size, mask_token, maximize=False,
-        )
-        # Upper bound: beam search for MAXIMUM drop ordering
-        upper_x = _beam_search_ordering(
-            model, text, tokens, beam_size, mask_token, maximize=True,
-        )
+        token_set = set(tokens)
+        attr_ordering = [token for token, _ in attrib if token in token_set]
+        aopc_x = _compute_aopc_for_ordering(model, text, attr_ordering, mask_token)
+        lower_x = _beam_search_ordering(model, text, tokens, beam_size, mask_token, maximize=False)
+        upper_x = _beam_search_ordering(model, text, tokens, beam_size, mask_token, maximize=True)
 
         aopc_scores.append(aopc_x)
         lower_scores.append(lower_x)
         upper_scores.append(upper_x)
 
-        # Per-example normalization (Eq 8)
         denom = upper_x - lower_x
         if denom > 1e-8:
             naopc_scores.append((aopc_x - lower_x) / denom)
 
-    naopc = float(np.mean(naopc_scores)) if naopc_scores else 0.0
+    naopc = float(numpy.mean(naopc_scores)) if naopc_scores else 0.0
     return {
-        "naopc": float(np.clip(naopc, 0.0, 1.0)),
-        "aopc_lower": float(np.mean(lower_scores)) if lower_scores else 0.0,
-        "aopc_upper": float(np.mean(upper_scores)) if upper_scores else 0.0,
+        "naopc": float(numpy.clip(naopc, 0.0, 1.0)),
+        "aopc_lower": float(numpy.mean(lower_scores)) if lower_scores else 0.0,
+        "aopc_upper": float(numpy.mean(upper_scores)) if upper_scores else 0.0,
     }
 
 
 def compute_filler_comprehensiveness(
-    model: Predictor, texts: list[str],
+    model: Predictor,
+    texts: list[str],
     attributions: list[list[tuple[str, float]]],
     k_values: tuple[int, ...] | list[int],
     sampler: UnigramSampler,
 ) -> dict[int, float]:
-    """Comprehensiveness using filler tokens instead of [MASK] (batched).
-
-    Replaces top-k tokens with corpus-sampled filler words to avoid OOD artifacts
-    that inflate mask-based metrics (Goodhart's Law, arXiv:2308.14272).
-    """
+    """Comprehensiveness with corpus-sampled filler replacements."""
     results = {k: [] for k in k_values}
-    original_probas = model.predict_proba(texts)
+    original_probabilities = model.predict_proba(texts)
 
-    # Phase 1: collect all filled texts
     filled_texts = []
-    index_map = []  # (text_idx, k)
-    for text_idx, (text, attrib) in enumerate(zip(texts, attributions)):
+    index_map = []
+    for text_index, (text, attrib) in enumerate(zip(texts, attributions)):
         for k in k_values:
             top_tokens = _top_k_tokens(attrib, k)
-            normalized = {t.lstrip("#").lower() for t in top_tokens}
+            normalized = {token.lstrip("#").lower() for token in top_tokens}
             words = text.split()
             filled_words = [
-                sampler.sample()
-                if w.lower().strip('.,!?;:"\'-') in normalized else w
-                for w in words
+                sampler.sample() if word.lower().strip('.,!?;:"\'-') in normalized else word
+                for word in words
             ]
-            filled_texts.append(' '.join(filled_words))
-            index_map.append((text_idx, k))
+            filled_texts.append(" ".join(filled_words))
+            index_map.append((text_index, k))
 
-    # Phase 2: single batch call
-    if filled_texts:
-        all_probas = model.predict_proba(filled_texts)
-    else:
-        all_probas = []
+    all_probabilities = model.predict_proba(filled_texts) if filled_texts else []
 
-    # Phase 3: distribute results
-    for i, (text_idx, k) in enumerate(index_map):
-        orig_proba = original_probas[text_idx]
-        pred_class = int(np.argmax(orig_proba))
-        orig_conf = orig_proba[pred_class]
-        filled_conf = all_probas[i][pred_class]
-        results[k].append(orig_conf - filled_conf)
+    for index, (text_index, k) in enumerate(index_map):
+        original_probability = original_probabilities[text_index]
+        predicted_class = int(numpy.argmax(original_probability))
+        original_confidence = original_probability[predicted_class]
+        filled_confidence = all_probabilities[index][predicted_class]
+        results[k].append(original_confidence - filled_confidence)
 
-    return {k: float(np.mean(scores)) for k, scores in results.items()}
+    return {k: float(numpy.mean(scores)) for k, scores in results.items()}
 
 
 def _build_word_importance_map(text: str, attrib: list[tuple[str, float]]) -> dict[int, float]:
-    """Map word positions in text to attribution importance scores."""
+    """Map word indices to normalized attribution magnitudes."""
     attrib_dict: dict[str, float] = {}
     for token, weight in attrib:
         key = token.lstrip("#").lower()
@@ -377,128 +362,108 @@ def _build_word_importance_map(text: str, attrib: list[tuple[str, float]]) -> di
             attrib_dict[key] = abs(weight)
 
     word_importance: dict[int, float] = {}
-    for i, word in enumerate(text.split()):
+    for index, word in enumerate(text.split()):
         clean = word.lower().strip('.,!?;:"\'-')
         if clean in attrib_dict:
-            word_importance[i] = attrib_dict[clean]
+            word_importance[index] = attrib_dict[clean]
     return word_importance
 
 
 def compute_soft_comprehensiveness(
-    model: Predictor, texts: list[str],
+    model: Predictor,
+    texts: list[str],
     attributions: list[list[tuple[str, float]]],
     mask_token: str,
     n_samples: int = 20,
     seed: int = 42,
 ) -> float:
-    """Soft Comprehensiveness via probabilistic token masking (batched, arXiv:2305.10496).
+    """Monte Carlo comprehensiveness under probabilistic masking."""
+    rng = numpy.random.default_rng(seed)
+    original_probabilities = model.predict_proba(texts)
 
-    Each token is masked with probability proportional to its normalized importance.
-    Reports average confidence drop across Monte Carlo samples.
-    Higher = better explanations.
-    """
-    rng = np.random.default_rng(seed)
-    original_probas = model.predict_proba(texts)
-
-    # Phase 1: generate all masked texts
     all_masked_texts = []
-    meta = []  # (text_idx, pred_class)
+    meta = []
 
-    for text_idx, (text, attrib, orig_proba) in enumerate(zip(texts, attributions, original_probas)):
-        pred_class = int(np.argmax(orig_proba))
+    for text_index, (text, attrib, original_probability) in enumerate(zip(texts, attributions, original_probabilities)):
+        predicted_class = int(numpy.argmax(original_probability))
         word_importance = _build_word_importance_map(text, attrib)
         words = text.split()
         if not words:
             continue
 
-        importances = np.array([word_importance.get(i, 0.0) for i in range(len(words))])
-        max_imp = importances.max()
-        if max_imp > 0:
-            importances = importances / max_imp
+        importances = numpy.array([word_importance.get(index, 0.0) for index in range(len(words))])
+        max_importance = importances.max()
+        if max_importance > 0:
+            importances = importances / max_importance
 
         for _ in range(n_samples):
             mask_flags = rng.random(len(words)) < importances
-            masked_words = [
-                mask_token if mask_flags[i] else words[i]
-                for i in range(len(words))
-            ]
-            all_masked_texts.append(' '.join(masked_words))
-            meta.append((text_idx, pred_class))
+            masked_words = [mask_token if mask_flags[index] else words[index] for index in range(len(words))]
+            all_masked_texts.append(" ".join(masked_words))
+            meta.append((text_index, predicted_class))
 
     if not all_masked_texts:
         return 0.0
 
-    # Phase 2: single batch call
-    all_probas = model.predict_proba(all_masked_texts)
+    all_probabilities = model.predict_proba(all_masked_texts)
 
-    # Phase 3: aggregate per-text
     scores_by_text: dict[int, list[float]] = {}
-    for i, (text_idx, pred_class) in enumerate(meta):
-        orig_conf = original_probas[text_idx][pred_class]
-        masked_conf = all_probas[i][pred_class]
-        if text_idx not in scores_by_text:
-            scores_by_text[text_idx] = []
-        scores_by_text[text_idx].append(orig_conf - masked_conf)
+    for index, (text_index, predicted_class) in enumerate(meta):
+        original_confidence = original_probabilities[text_index][predicted_class]
+        masked_confidence = all_probabilities[index][predicted_class]
+        if text_index not in scores_by_text:
+            scores_by_text[text_index] = []
+        scores_by_text[text_index].append(original_confidence - masked_confidence)
 
-    scores = [float(np.mean(drops)) for drops in scores_by_text.values()]
-    return float(np.mean(scores)) if scores else 0.0
+    scores = [float(numpy.mean(drops)) for drops in scores_by_text.values()]
+    return float(numpy.mean(scores)) if scores else 0.0
 
 
 def compute_soft_sufficiency(
-    model: Predictor, texts: list[str],
+    model: Predictor,
+    texts: list[str],
     attributions: list[list[tuple[str, float]]],
     mask_token: str,
     n_samples: int = 20,
     seed: int = 42,
 ) -> float:
-    """Soft Sufficiency via probabilistic token retention (batched, arXiv:2305.10496).
+    """Monte Carlo sufficiency under probabilistic retention."""
+    rng = numpy.random.default_rng(seed)
+    original_probabilities = model.predict_proba(texts)
 
-    Each token is retained with probability proportional to its normalized importance.
-    Reports average confidence drop across Monte Carlo samples.
-    Lower = better (retaining important tokens should preserve confidence).
-    """
-    rng = np.random.default_rng(seed)
-    original_probas = model.predict_proba(texts)
-
-    # Phase 1: generate all masked texts
     all_masked_texts = []
-    meta = []  # (text_idx, pred_class)
+    meta = []
 
-    for text_idx, (text, attrib, orig_proba) in enumerate(zip(texts, attributions, original_probas)):
-        pred_class = int(np.argmax(orig_proba))
+    for text_index, (text, attrib, original_probability) in enumerate(zip(texts, attributions, original_probabilities)):
+        predicted_class = int(numpy.argmax(original_probability))
         word_importance = _build_word_importance_map(text, attrib)
         words = text.split()
         if not words:
             continue
 
-        importances = np.array([word_importance.get(i, 0.0) for i in range(len(words))])
-        max_imp = importances.max()
-        if max_imp > 0:
-            importances = importances / max_imp
+        importances = numpy.array([word_importance.get(index, 0.0) for index in range(len(words))])
+        max_importance = importances.max()
+        if max_importance > 0:
+            importances = importances / max_importance
 
         for _ in range(n_samples):
             retain_flags = rng.random(len(words)) < importances
-            masked_words = [
-                words[i] if retain_flags[i] else mask_token
-                for i in range(len(words))
-            ]
-            all_masked_texts.append(' '.join(masked_words))
-            meta.append((text_idx, pred_class))
+            masked_words = [words[index] if retain_flags[index] else mask_token for index in range(len(words))]
+            all_masked_texts.append(" ".join(masked_words))
+            meta.append((text_index, predicted_class))
 
     if not all_masked_texts:
         return 0.0
 
-    # Phase 2: single batch call
-    all_probas = model.predict_proba(all_masked_texts)
+    all_probabilities = model.predict_proba(all_masked_texts)
 
-    # Phase 3: aggregate per-text
     scores_by_text: dict[int, list[float]] = {}
-    for i, (text_idx, pred_class) in enumerate(meta):
-        orig_conf = original_probas[text_idx][pred_class]
-        masked_conf = all_probas[i][pred_class]
-        if text_idx not in scores_by_text:
-            scores_by_text[text_idx] = []
-        scores_by_text[text_idx].append(orig_conf - masked_conf)
+    for index, (text_index, predicted_class) in enumerate(meta):
+        original_confidence = original_probabilities[text_index][predicted_class]
+        masked_confidence = all_probabilities[index][predicted_class]
+        if text_index not in scores_by_text:
+            scores_by_text[text_index] = []
+        scores_by_text[text_index].append(original_confidence - masked_confidence)
 
-    scores = [float(np.mean(drops)) for drops in scores_by_text.values()]
-    return float(np.mean(scores)) if scores else 0.0
+    scores = [float(numpy.mean(drops)) for drops in scores_by_text.values()]
+    return float(numpy.mean(scores)) if scores else 0.0

@@ -1,27 +1,16 @@
-"""SPLADE adapter explainers for fair baseline comparison.
+"""Baseline explainers that operate on a trained SPLADE classifier."""
 
-All adapters explain the SPLADE model's predictions (using its internal
-DistilBERT), so faithfulness metrics are measured against the same model.
-This eliminates the confound of comparing explanations across different models.
-"""
-
-from __future__ import annotations
-
-from typing import TYPE_CHECKING
-
-import numpy as np
+import numpy
 import torch
+from captum.attr import LayerIntegratedGradients
 from lime.lime_text import LimeTextExplainer
 
-from src.baselines import SPECIAL_TOKENS
+from src.models.classifier import SPECIAL_TOKENS, SPLADEClassifier
 from src.utils.cuda import DEVICE
-
-if TYPE_CHECKING:
-    from src.models import SPLADEClassifier
 
 
 class SPLADEAttentionExplainer:
-    """Attention-based explanations using SPLADE's internal DistilBERT."""
+    """Attention baseline over the classifier encoder."""
 
     def __init__(self, clf: SPLADEClassifier):
         self.clf = clf
@@ -29,38 +18,42 @@ class SPLADEAttentionExplainer:
         self.num_labels = clf.num_labels
 
     def explain(self, text: str, top_k: int = 10) -> list[tuple[str, float]]:
-        enc = self.tokenizer(
-            text, max_length=self.clf.max_length, padding="max_length",
-            truncation=True, return_tensors="pt",
+        encoding = self.tokenizer(
+            text,
+            max_length=self.clf.max_length,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
         )
-        input_ids = enc["input_ids"].to(DEVICE, non_blocking=True)
-        attention_mask = enc["attention_mask"].to(DEVICE, non_blocking=True)
+        input_ids = encoding["input_ids"].to(DEVICE, non_blocking=True)
+        attention_mask = encoding["attention_mask"].to(DEVICE, non_blocking=True)
 
         with torch.inference_mode():
             outputs = self.clf.model.bert(
-                input_ids=input_ids, attention_mask=attention_mask,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
                 output_attentions=True,
             )
 
-        attentions = outputs.attentions[-1][0]  # [heads, seq, seq]
-        seq_len = int(attention_mask.sum().item())
-        attn = attentions.mean(dim=0)  # [seq, seq]
-        token_importance = attn[:seq_len, :seq_len].sum(dim=0)
+        attention = outputs.attentions[-1][0]
+        sequence_length = int(attention_mask.sum().item())
+        averaged_attention = attention.mean(dim=0)
+        token_importance = averaged_attention[:sequence_length, :sequence_length].sum(dim=0)
 
-        importance = token_importance.cpu().numpy()
-        tokens = self.tokenizer.convert_ids_to_tokens(input_ids[0, :seq_len].cpu().tolist())
+        weights = token_importance.cpu().numpy()
+        tokens = self.tokenizer.convert_ids_to_tokens(input_ids[0, :sequence_length].cpu().tolist())
 
         explanations = [
             (token.replace("##", ""), float(weight))
-            for token, weight in zip(tokens, importance)
+            for token, weight in zip(tokens, weights)
             if token not in SPECIAL_TOKENS
         ]
-        explanations.sort(key=lambda x: x[1], reverse=True)
+        explanations.sort(key=lambda pair: pair[1], reverse=True)
         return explanations[:top_k]
 
 
 class SPLADEIntegratedGradientsExplainer:
-    """Integrated Gradients explanations using SPLADE's DistilBERT embeddings."""
+    """Integrated Gradients baseline over SPLADE embeddings."""
 
     def __init__(self, clf: SPLADEClassifier, n_steps: int = 50):
         self.clf = clf
@@ -68,63 +61,55 @@ class SPLADEIntegratedGradientsExplainer:
         self.num_labels = clf.num_labels
         self.n_steps = n_steps
 
-        from captum.attr import LayerIntegratedGradients
-
-        def forward_func(input_ids, attention_mask):
+        def forward_func(input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
             logits, _ = self.clf.model(input_ids, attention_mask)
             return logits
 
-        # torch.compile wraps bert in OptimizedModule; Captum hooks need the
-        # original submodule to fire during forward passes.
-        bert = getattr(clf.model.bert, '_orig_mod', clf.model.bert)
-        self._lig = LayerIntegratedGradients(
-            forward_func, bert.embeddings.word_embeddings,
+        self.integrated_gradients = LayerIntegratedGradients(
+            forward_func,
+            self.clf.model.bert.embeddings.word_embeddings,
         )
 
     def explain(self, text: str, top_k: int = 10) -> list[tuple[str, float]]:
-        enc = self.tokenizer(
-            text, max_length=self.clf.max_length, padding="max_length",
-            truncation=True, return_tensors="pt",
+        encoding = self.tokenizer(
+            text,
+            max_length=self.clf.max_length,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
         )
-        input_ids = enc["input_ids"].to(DEVICE, non_blocking=True)
-        attention_mask = enc["attention_mask"].to(DEVICE, non_blocking=True)
+        input_ids = encoding["input_ids"].to(DEVICE, non_blocking=True)
+        attention_mask = encoding["attention_mask"].to(DEVICE, non_blocking=True)
         baseline_ids = torch.full_like(input_ids, self.tokenizer.pad_token_id)
 
-        with torch.no_grad():
+        with torch.inference_mode():
             logits, _ = self.clf.model(input_ids, attention_mask)
-            pred_class = logits.argmax(dim=-1).item()
+            predicted_class = logits.argmax(dim=-1).item()
 
-        # Temporarily unwrap compiled BERT so Captum hooks fire correctly
-        compiled_bert = self.clf.model.bert
-        orig_bert = getattr(compiled_bert, '_orig_mod', compiled_bert)
-        self.clf.model.bert = orig_bert
-        try:
-            attributions = self._lig.attribute(
-                inputs=input_ids,
-                baselines=baseline_ids,
-                additional_forward_args=(attention_mask,),
-                target=pred_class,
-                n_steps=self.n_steps,
-            )
-        finally:
-            self.clf.model.bert = compiled_bert
+        attributions = self.integrated_gradients.attribute(
+            inputs=input_ids,
+            baselines=baseline_ids,
+            additional_forward_args=(attention_mask,),
+            target=predicted_class,
+            n_steps=self.n_steps,
+        )
 
         token_attributions = attributions.sum(dim=-1).squeeze(0)
-        seq_len = int(attention_mask.sum().item())
-        tokens = self.tokenizer.convert_ids_to_tokens(input_ids[0, :seq_len].cpu().tolist())
-        attrs = token_attributions[:seq_len].cpu().detach().numpy()
+        sequence_length = int(attention_mask.sum().item())
+        tokens = self.tokenizer.convert_ids_to_tokens(input_ids[0, :sequence_length].cpu().tolist())
+        values = token_attributions[:sequence_length].cpu().detach().numpy()
 
         explanations = [
-            (token.replace("##", ""), float(abs(attr)))
-            for token, attr in zip(tokens, attrs)
+            (token.replace("##", ""), float(abs(value)))
+            for token, value in zip(tokens, values)
             if token not in SPECIAL_TOKENS
         ]
-        explanations.sort(key=lambda x: x[1], reverse=True)
+        explanations.sort(key=lambda pair: pair[1], reverse=True)
         return explanations[:top_k]
 
 
 class SPLADELIMEExplainer:
-    """LIME explanations using SPLADE as the black-box model."""
+    """LIME baseline over SPLADE predictions."""
 
     def __init__(self, clf: SPLADEClassifier, num_samples: int = 500):
         self.clf = clf
@@ -132,21 +117,24 @@ class SPLADELIMEExplainer:
         self.num_labels = clf.num_labels
         self.num_samples = num_samples
         self.lime_explainer = LimeTextExplainer(
-            class_names=[f"class_{i}" for i in range(clf.num_labels)],
+            class_names=[f"class_{label}" for label in range(clf.num_labels)],
         )
 
     def explain(self, text: str, top_k: int = 10) -> list[tuple[str, float]]:
-        def predict_fn(texts):
-            text_list = texts.tolist() if hasattr(texts, 'tolist') else list(texts)
-            return np.array(self.clf.predict_proba(text_list))
+        def predict_fn(texts) -> numpy.ndarray:
+            text_list = texts.tolist() if hasattr(texts, "tolist") else list(texts)
+            return numpy.array(self.clf.predict_proba(text_list))
 
-        probs = self.clf.predict_proba([text])[0]
-        pred_class = int(np.argmax(probs))
+        probabilities = self.clf.predict_proba([text])[0]
+        predicted_class = int(numpy.argmax(probabilities))
 
-        exp = self.lime_explainer.explain_instance(
-            text, predict_fn, num_features=top_k,
-            num_samples=self.num_samples, labels=[pred_class],
+        explanation = self.lime_explainer.explain_instance(
+            text,
+            predict_fn,
+            num_features=top_k,
+            num_samples=self.num_samples,
+            labels=[predicted_class],
         )
-        explanations = exp.as_list(label=pred_class)
-        explanations.sort(key=lambda x: abs(x[1]), reverse=True)
-        return [(word, float(weight)) for word, weight in explanations[:top_k]]
+        scores = explanation.as_list(label=predicted_class)
+        scores.sort(key=lambda pair: abs(pair[1]), reverse=True)
+        return [(word, float(weight)) for word, weight in scores[:top_k]]

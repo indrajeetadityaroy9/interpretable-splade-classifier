@@ -1,1 +1,1 @@
-"""Training: losses, optimizers, schedulers, fine-tuning."""
+"""Training package."""

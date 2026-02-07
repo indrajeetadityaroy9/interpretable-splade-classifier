@@ -21,13 +21,13 @@ htmlcov/
 .ipynb_checkpoints/
 
 # Model artifacts
-models/
+/models/
 *.pth
 *.pt
 *.safetensors
 
 # Data
-data/
+/data/
 *.csv
 *.json
 *.jsonl
