@@ -220,57 +220,6 @@ Ablation variants are created by temporarily zeroing CIS constants at runtime, n
 python -m splade.scripts.run_ablation --config experiments/ablation/cis_ablation.yaml
 ```
 
----
-
-## Repository Structure
-
-```
-splade/
-├── models/
-│   ├── splade.py                  # SpladeModel: encoder → vocab bottleneck → ReLU MLP classifier
-│   └── layers/activation.py      # DReLU (shifted ReLU with learnable thresholds)
-├── training/
-│   ├── loop.py                    # Training loop: EMA, early stopping, AGC, CIS circuit losses
-│   ├── losses.py                  # DF-FLOPS sparsity regularization
-│   ├── circuit_losses.py          # CIS: completeness, separation, sharpness (W_eff-based)
-│   ├── optim.py                   # LR range test, AdamW setup, AGC implementation
-│   ├── constants.py               # All hardwired CIS hyperparameters (single source of truth)
-│   └── scheduler/lambda_sched.py  # SAT-style quadratic regularization schedule
-├── mechanistic/
-│   ├── attribution.py             # DLA computation via W_eff and verification
-│   ├── circuits.py                # Vocabulary circuit extraction and completeness
-│   ├── patching.py                # Sparse vector ablation / activation patching
-│   ├── metrics.py                 # Semantic fidelity (within-class / cross-class Jaccard)
-│   └── sae.py                     # Sparse autoencoder baseline
-├── evaluation/
-│   ├── benchmark.py               # Unified 12-metric benchmarking pipeline
-│   ├── explainers.py              # 7 baseline explainers (LIME, IG, GradSHAP, etc.)
-│   ├── faithfulness.py            # ERASER, AOPC, NAOPC, monotonicity, soft metrics
-│   ├── f_fidelity.py              # F-Fidelity surrogate fine-tuning and evaluation
-│   ├── mechanistic.py             # Mechanistic evaluation orchestration
-│   ├── integration.py             # Circuit–faithfulness alignment analysis
-│   └── token_alignment.py         # Subword-to-word attribution aggregation
-├── data/loader.py                 # HuggingFace dataset loading (SST-2, AG News, IMDB, Yelp)
-├── inference.py                   # Prediction, scoring, and DLA explanation via W_eff
-├── pipelines.py                   # Unified training + inference interface
-├── config/
-│   ├── schema.py                  # Dataclass configuration schema (no TrainingConfig)
-│   └── load.py                    # YAML configuration loader
-├── scripts/
-│   ├── run_experiment.py          # Main entry point: 3-phase CIS pipeline
-│   └── run_ablation.py            # Ablation via runtime constant patching
-└── utils/cuda.py                  # Device setup, seeding, precision config
-
-experiments/                       # YAML experiment configurations
-├── main/                          # Primary benchmarks (CIS, DF-FLOPS baseline)
-├── datasets/                      # Cross-dataset (AG News, IMDB, Yelp)
-├── scaling/                       # Encoder scaling (BERT-base, BERT-large)
-├── ablation/                      # CIS ablation variants
-└── mechanistic/                   # Mechanistic analysis and SAE comparison
-```
-
----
-
 ## Datasets
 
 All datasets are loaded from HuggingFace `datasets`:
