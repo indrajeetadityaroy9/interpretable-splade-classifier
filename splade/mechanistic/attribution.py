@@ -1,57 +1,20 @@
-from dataclasses import dataclass
-
 import torch
 
-from splade.utils.cuda import DEVICE
 
-
-@dataclass
-class VocabularyAttribution:
-    token_ids: list[int]
-    token_names: list[str]
-    attribution_scores: list[float]
-    class_idx: int
-    logit: float
-
-
-def compute_direct_logit_attribution(
+def compute_attribution_tensor(
     sparse_vector: torch.Tensor,
-    classifier_weight: torch.Tensor,
-    tokenizer,
-    class_idx: int,
-) -> VocabularyAttribution:
-    """Compute Direct Logit Attribution: element-wise sparse_vector * classifier_weight[class_idx].
+    W_eff: torch.Tensor,
+    class_indices: torch.Tensor,
+) -> torch.Tensor:
+    """Core DLA: attr[b,j] = s[b,j] * W_eff[b, c_b, j].
 
-    The sum of attribution scores exactly equals the logit for the target class
-    (verifiable invariant, ignoring classifier bias).
-
-    All computation stays on GPU. Results are converted to Python types at the boundary.
+    Args:
+        sparse_vector: [B, V] sparse activations.
+        W_eff: [B, C, V] effective weight matrix.
+        class_indices: [B] per-sample class index.
+    Returns:
+        [B, V] attribution tensor.
     """
-    sparse_vector = sparse_vector.to(DEVICE)
-    classifier_weight = classifier_weight.to(DEVICE)
-
-    if classifier_weight.ndim == 2:
-        weights = classifier_weight[class_idx]
-    else:
-        weights = classifier_weight
-
-    attributions = sparse_vector * weights
-    nonzero_mask = attributions != 0
-    token_ids = torch.where(nonzero_mask)[0]
-
-    sorted_indices = torch.argsort(attributions[token_ids].abs(), descending=True)
-    token_ids = token_ids[sorted_indices]
-    scores = attributions[token_ids]
-
-    token_ids_list = token_ids.tolist()
-    token_names = tokenizer.convert_ids_to_tokens(token_ids_list)
-
-    return VocabularyAttribution(
-        token_ids=token_ids_list,
-        token_names=token_names,
-        attribution_scores=scores.tolist(),
-        class_idx=class_idx,
-        logit=float(attributions.sum().item()),
-    )
-
-
+    batch_indices = torch.arange(sparse_vector.shape[0], device=sparse_vector.device)
+    target_weights = W_eff[batch_indices, class_indices]
+    return sparse_vector * target_weights

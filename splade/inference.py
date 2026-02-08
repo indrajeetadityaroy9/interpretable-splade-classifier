@@ -2,15 +2,17 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from splade.evaluation.constants import SPECIAL_TOKENS
-from splade.utils.cuda import COMPUTE_DTYPE, DEVICE, unwrap_compiled
+from splade.mechanistic.attribution import compute_attribution_tensor
+from splade.utils.cuda import COMPUTE_DTYPE, DEVICE
 
 def _run_inference_loop(
     model: torch.nn.Module,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     extract_sparse: bool = False,
+    extract_weff: bool = False,
     batch_size: int = 32,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     loader = DataLoader(
         TensorDataset(input_ids, attention_mask),
         batch_size=batch_size,
@@ -20,30 +22,34 @@ def _run_inference_loop(
     )
     all_logits = []
     all_sparse = [] if extract_sparse else None
+    all_weff = [] if extract_weff else None
 
     with torch.inference_mode(), torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
         for batch_ids, batch_mask in loader:
             batch_ids = batch_ids.to(DEVICE, non_blocking=True)
             batch_mask = batch_mask.to(DEVICE, non_blocking=True)
-            logits, sparse = model(batch_ids, batch_mask)
+            logits, sparse, w_eff, _ = model(batch_ids, batch_mask)
             all_logits.append(logits)
             if extract_sparse:
                 all_sparse.append(sparse)
+            if extract_weff:
+                all_weff.append(w_eff)
 
     logits = torch.cat(all_logits, dim=0)
     sparse = torch.cat(all_sparse, dim=0) if extract_sparse else None
-    return logits, sparse
+    weff = torch.cat(all_weff, dim=0) if extract_weff else None
+    return logits, sparse, weff
 
-def predict_model(model, tokenizer, texts: list[str], max_length: int, batch_size: int = 32, num_labels: int = 2) -> list[int]:
+def _predict_model(model, tokenizer, texts: list[str], max_length: int, batch_size: int = 32, num_labels: int = 2) -> list[int]:
     encoding = tokenizer(texts, max_length=max_length, padding="max_length", truncation=True, return_tensors="pt")
-    logits, _ = _run_inference_loop(model, encoding["input_ids"], encoding["attention_mask"], batch_size=batch_size)
+    logits, _, _ = _run_inference_loop(model, encoding["input_ids"], encoding["attention_mask"], batch_size=batch_size)
     if num_labels == 1:
         return (logits.squeeze(-1) > 0).int().tolist()
     return logits.argmax(dim=1).tolist()
 
 def predict_proba_model(model, tokenizer, texts: list[str], max_length: int, batch_size: int = 32, num_labels: int = 2) -> list[list[float]]:
     encoding = tokenizer(texts, max_length=max_length, padding="max_length", truncation=True, return_tensors="pt")
-    logits, _ = _run_inference_loop(model, encoding["input_ids"], encoding["attention_mask"], batch_size=batch_size)
+    logits, _, _ = _run_inference_loop(model, encoding["input_ids"], encoding["attention_mask"], batch_size=batch_size)
     if num_labels == 1:
         positive = torch.sigmoid(logits).squeeze(-1)
         probabilities = torch.stack([1 - positive, positive], dim=1)
@@ -52,7 +58,7 @@ def predict_proba_model(model, tokenizer, texts: list[str], max_length: int, bat
     return probabilities.tolist()
 
 def score_model(model, tokenizer, texts: list[str], labels: list[int], max_length: int, batch_size: int = 32, num_labels: int = 2) -> float:
-    preds = predict_model(model, tokenizer, texts, max_length, batch_size, num_labels)
+    preds = _predict_model(model, tokenizer, texts, max_length, batch_size, num_labels)
     return sum(p == t for p, t in zip(preds, labels)) / len(labels)
 
 
@@ -66,9 +72,9 @@ def explain_model(
     input_only: bool = False,
 ) -> list[tuple[str, float]]:
     encoding = tokenizer([text], max_length=max_length, padding="max_length", truncation=True, return_tensors="pt")
-    logits, sparse = _run_inference_loop(
+    logits, sparse, W_eff = _run_inference_loop(
         model, encoding["input_ids"], encoding["attention_mask"],
-        extract_sparse=True, batch_size=1,
+        extract_sparse=True, extract_weff=True, batch_size=1,
     )
     sparse_vector = sparse[0]
 
@@ -76,12 +82,10 @@ def explain_model(
         probabilities = torch.nn.functional.softmax(logits, dim=-1)
         target_class = int(probabilities[0].argmax().item())
 
-    with torch.inference_mode():
-        _model = unwrap_compiled(model)
-        W_eff, _ = _model.compute_effective_weights(sparse_vector.unsqueeze(0))
-        weights = W_eff[0, target_class]
-
-    contributions = sparse_vector * weights
+    contributions = compute_attribution_tensor(
+        sparse_vector.unsqueeze(0), W_eff,
+        torch.tensor([target_class], device=sparse_vector.device),
+    )[0]
     nonzero_indices = contributions.nonzero(as_tuple=True)[0]
 
     if input_only:
@@ -123,16 +127,15 @@ def explain_model_batch(
     batch_size: int = 32,
 ) -> list[list[tuple[str, float]]]:
     encoding = tokenizer(texts, max_length=max_length, padding="max_length", truncation=True, return_tensors="pt")
-    logits, sparse = _run_inference_loop(
+    logits, sparse, W_eff = _run_inference_loop(
         model, encoding["input_ids"], encoding["attention_mask"],
-        extract_sparse=True, batch_size=batch_size,
+        extract_sparse=True, extract_weff=True, batch_size=batch_size,
     )
     probabilities = torch.nn.functional.softmax(logits, dim=-1)
     target_classes = probabilities.argmax(dim=-1).tolist()
 
-    with torch.inference_mode():
-        _model = unwrap_compiled(model)
-        W_eff, _ = _model.compute_effective_weights(sparse)
+    target_classes_tensor = torch.tensor(target_classes, device=sparse.device)
+    all_contributions = compute_attribution_tensor(sparse, W_eff, target_classes_tensor)
 
     input_id_sets = None
     if input_only:
@@ -142,9 +145,7 @@ def explain_model_batch(
 
     all_explanations = []
     for idx in range(len(texts)):
-        target_class = target_classes[idx]
-        weights = W_eff[idx, target_class]
-        contributions = sparse[idx] * weights
+        contributions = all_contributions[idx]
         nonzero_indices = contributions.nonzero(as_tuple=True)[0]
 
         if input_only and input_id_sets is not None:

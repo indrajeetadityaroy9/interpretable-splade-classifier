@@ -2,9 +2,7 @@ from dataclasses import dataclass, field
 
 import torch
 
-from splade.mechanistic.attribution import (VocabularyAttribution,
-                                            compute_direct_logit_attribution)
-from splade.mechanistic.patching import patch_sparse_vector
+from splade.mechanistic.attribution import compute_attribution_tensor
 from splade.utils.cuda import COMPUTE_DTYPE, DEVICE, unwrap_compiled
 
 
@@ -25,43 +23,40 @@ def extract_vocabulary_circuit(
     tokenizer,
     class_idx: int,
     threshold: float = 0.01,
+    precomputed_attributions: torch.Tensor | None = None,
 ) -> VocabularyCircuit:
     """Identify vocabulary tokens with consistent high attribution across examples.
 
     Tokens are included in the circuit if their mean absolute attribution exceeds
     the threshold fraction of total attribution mass.
+
+    If precomputed_attributions is provided (e.g. from training centroid tracker),
+    skip the per-sample forward+W_eff+DLA loop and use it directly.
     """
     _model = unwrap_compiled(model)
-    vocab_size = _model.padded_vocab_size
 
-    token_attribution_sums = torch.zeros(vocab_size, device=DEVICE)
-    token_counts = torch.zeros(vocab_size, device=DEVICE)
-    n_examples = 0
+    if precomputed_attributions is not None:
+        mean_attributions = precomputed_attributions
+    else:
+        vocab_size = _model.padded_vocab_size
+        token_attribution_sums = torch.zeros(vocab_size, device=DEVICE)
+        n_examples = 0
 
-    for input_ids, attention_mask in zip(input_ids_list, attention_mask_list):
-        with torch.inference_mode(), torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
-            _, sparse_vector = _model(input_ids, attention_mask)
+        for input_ids, attention_mask in zip(input_ids_list, attention_mask_list):
+            with torch.inference_mode(), torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
+                _, sparse_vector, W_eff, _ = _model(input_ids, attention_mask)
 
-        sparse_v = sparse_vector[0]
-        with torch.inference_mode():
-            W_eff, _ = _model.compute_effective_weights(sparse_vector)
-        attrib = compute_direct_logit_attribution(
-            sparse_v, W_eff[0], tokenizer, class_idx
-        )
+            attr = compute_attribution_tensor(
+                sparse_vector, W_eff,
+                torch.tensor([class_idx], device=sparse_vector.device),
+            )
+            token_attribution_sums += attr[0].abs()
+            n_examples += 1
 
-        for tid, score in zip(attrib.token_ids, attrib.attribution_scores):
-            token_attribution_sums[tid] += abs(score)
-            token_counts[tid] += 1
-        n_examples += 1
+        if n_examples == 0:
+            return VocabularyCircuit(class_idx=class_idx)
 
-    if n_examples == 0:
-        return VocabularyCircuit(class_idx=class_idx)
-
-    mean_attributions = torch.where(
-        token_counts > 0,
-        token_attribution_sums / n_examples,
-        torch.zeros(1, device=DEVICE),
-    )
+        mean_attributions = token_attribution_sums / n_examples
 
     total_mass = mean_attributions.sum()
     if total_mass < 1e-12:
@@ -106,9 +101,11 @@ def measure_circuit_completeness(
     total = 0
 
     for input_ids, attention_mask, label in zip(input_ids_list, attention_mask_list, labels):
-        _, patched_logits, _ = patch_sparse_vector(
-            model, input_ids, attention_mask, non_circuit_ids, patch_value=0.0
-        )
+        with torch.inference_mode(), torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
+            _, original_sparse, _, _ = _model(input_ids, attention_mask)
+            patched_sparse = original_sparse.clone()
+            patched_sparse[:, non_circuit_ids] = 0.0
+            patched_logits = _model.classifier_logits_only(patched_sparse)
         predicted = int(patched_logits.argmax(dim=-1).item())
         if predicted == label:
             correct += 1

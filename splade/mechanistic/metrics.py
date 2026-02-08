@@ -1,6 +1,6 @@
 import torch
 
-from splade.mechanistic.attribution import compute_direct_logit_attribution
+from splade.mechanistic.attribution import compute_attribution_tensor
 from splade.utils.cuda import COMPUTE_DTYPE, unwrap_compiled
 
 
@@ -11,39 +11,51 @@ def measure_semantic_fidelity(
     labels: list[int],
     tokenizer,
     top_k: int = 10,
+    precomputed_attributions: dict[int, torch.Tensor] | None = None,
 ) -> dict:
     """Measure whether high-attribution tokens form semantically coherent explanations.
 
     Computes per-class token frequency overlap and consistency metrics.
+
+    If precomputed_attributions is provided (e.g. from centroid_tracker), uses
+    those to derive class-level top tokens and cross-class overlap, skipping
+    per-sample forward passes for those metrics. Per-sample within-class
+    consistency still requires forward passes.
     """
     _model = unwrap_compiled(model)
-
     num_classes = _model.classifier_fc2.weight.shape[0]
-    class_token_counts: dict[int, dict[int, int]] = {c: {} for c in range(num_classes)}
+
+    # Per-sample top-k tokens (always computed — needed for within-class Jaccard)
     sample_top_tokens: list[set[int]] = []
     sample_labels: list[int] = []
+    class_token_counts: dict[int, dict[int, int]] = {c: {} for c in range(num_classes)}
 
     for input_ids, attention_mask, label in zip(input_ids_list, attention_mask_list, labels):
         with torch.inference_mode(), torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
-            _, sparse_vector = _model(input_ids, attention_mask)
+            _, sparse_vector, W_eff, _ = _model(input_ids, attention_mask)
 
-        sparse_v = sparse_vector[0]
-        with torch.inference_mode():
-            W_eff, _ = _model.compute_effective_weights(sparse_vector)
-        attrib = compute_direct_logit_attribution(sparse_v, W_eff[0], tokenizer, label)
+        attr = compute_attribution_tensor(
+            sparse_vector, W_eff,
+            torch.tensor([label], device=sparse_vector.device),
+        )
+        top_k_ids = attr[0].abs().topk(top_k).indices.tolist()
 
-        sample_top_set = set(attrib.token_ids[:top_k])
-        sample_top_tokens.append(sample_top_set)
+        sample_top_tokens.append(set(top_k_ids))
         sample_labels.append(label)
 
-        for tid in attrib.token_ids[:top_k]:
+        for tid in top_k_ids:
             class_token_counts[label][tid] = class_token_counts[label].get(tid, 0) + 1
 
-    class_top_tokens = {}
-    for c in range(num_classes):
-        counts = class_token_counts[c]
-        sorted_tokens = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:top_k]
-        class_top_tokens[c] = set(tid for tid, _ in sorted_tokens)
+    # Class-level top tokens: use precomputed centroids if available
+    class_top_tokens: dict[int, set[int]] = {}
+    if precomputed_attributions is not None:
+        for c, attr_vec in precomputed_attributions.items():
+            class_top_tokens[c] = set(attr_vec.abs().topk(top_k).indices.tolist())
+    else:
+        for c in range(num_classes):
+            counts = class_token_counts[c]
+            sorted_tokens = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:top_k]
+            class_top_tokens[c] = set(tid for tid, _ in sorted_tokens)
 
     # Within-class consistency: average pairwise Jaccard across samples of the same class
     within_class_overlaps = []

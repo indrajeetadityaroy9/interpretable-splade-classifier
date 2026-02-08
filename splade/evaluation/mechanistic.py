@@ -2,15 +2,13 @@ from dataclasses import dataclass, field
 
 import torch
 
-from splade.mechanistic.attribution import (VocabularyAttribution,
-                                            compute_direct_logit_attribution)
+from splade.mechanistic.attribution import compute_attribution_tensor
 from splade.mechanistic.circuits import (VocabularyCircuit,
                                          extract_vocabulary_circuit,
                                          measure_circuit_completeness,
                                          visualize_circuit)
 from splade.mechanistic.metrics import measure_semantic_fidelity
-from splade.mechanistic.patching import ablate_vocabulary_tokens
-from splade.utils.cuda import COMPUTE_DTYPE, DEVICE, unwrap_compiled
+from splade.utils.cuda import COMPUTE_DTYPE, unwrap_compiled
 
 
 @dataclass
@@ -47,7 +45,7 @@ def _run_sae_comparison(
 
     for input_ids, attention_mask, label in zip(input_ids_list, attention_mask_list, labels):
         with torch.inference_mode(), torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
-            _, sparse_vector = _model(input_ids, attention_mask)
+            _, sparse_vector, _, _ = _model(input_ids, attention_mask)
             bert_output = _model.bert(input_ids=input_ids, attention_mask=attention_mask)
             hidden = bert_output.last_hidden_state
             transformed = _model.vocab_transform(hidden)
@@ -100,6 +98,7 @@ def run_mechanistic_evaluation(
     num_classes: int,
     circuit_threshold: float = 0.01,
     run_sae_comparison: bool = False,
+    centroid_tracker=None,
 ) -> MechanisticResults:
     """Run the full mechanistic interpretability evaluation suite."""
     _model = unwrap_compiled(model)
@@ -111,18 +110,17 @@ def run_mechanistic_evaluation(
     n = 0
     for input_ids, attention_mask, label in zip(input_ids_list, attention_mask_list, labels):
         with torch.inference_mode(), torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
-            logits, sparse_vector = _model(input_ids, attention_mask)
+            logits, sparse_vector, W_eff, b_eff = _model(input_ids, attention_mask)
 
         pred = int(logits.argmax(dim=-1).item())
         if pred == label:
             correct += 1
 
-        sparse_v = sparse_vector[0]
         actual_logit = float(logits[0, label].item())
-        with torch.inference_mode():
-            W_eff, b_eff = _model.compute_effective_weights(sparse_vector)
-        attrib = compute_direct_logit_attribution(sparse_v, W_eff[0], tokenizer, label)
-        reconstructed = attrib.logit + float(b_eff[0, label].item())
+        attr = compute_attribution_tensor(
+            sparse_vector, W_eff, torch.tensor([label], device=sparse_vector.device),
+        )
+        reconstructed = float(attr[0].sum().item()) + float(b_eff[0, label].item())
         total_error += abs(actual_logit - reconstructed)
         n += 1
 
@@ -139,9 +137,15 @@ def run_mechanistic_evaluation(
             continue
 
         class_ids, class_masks = zip(*class_inputs)
+        precomputed = None
+        if centroid_tracker is not None and class_idx < centroid_tracker.num_classes:
+            if centroid_tracker._initialized[class_idx]:
+                precomputed = centroid_tracker.centroids[class_idx]
+
         circuit = extract_vocabulary_circuit(
             model, list(class_ids), list(class_masks),
             tokenizer, class_idx, threshold=circuit_threshold,
+            precomputed_attributions=precomputed,
         )
         results.circuits[class_idx] = circuit
 
@@ -156,8 +160,17 @@ def run_mechanistic_evaluation(
         results.circuit_completeness[class_idx] = completeness
 
     # 4. Semantic fidelity
+    precomputed_dict = None
+    if centroid_tracker is not None:
+        precomputed_dict = {
+            c: centroid_tracker.centroids[c]
+            for c in range(num_classes)
+            if centroid_tracker._initialized[c]
+        }
+
     results.semantic_fidelity = measure_semantic_fidelity(
         model, input_ids_list, attention_mask_list, labels, tokenizer,
+        precomputed_attributions=precomputed_dict,
     )
 
     # 5. SAE baseline comparison (optional)

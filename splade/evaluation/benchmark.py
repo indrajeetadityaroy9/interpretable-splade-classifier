@@ -29,7 +29,6 @@ class InterpretabilityResult:
     filler_comprehensiveness: dict[int, float] = field(default_factory=dict)
     soft_comprehensiveness: float = 0.0
     soft_sufficiency: float = 0.0
-    explanation_time: float = 0.0
     accuracy: float = 0.0
     inference_latency: float = 0.0
     causal_faithfulness: float = 0.0
@@ -179,7 +178,6 @@ def benchmark_explainer(
     print("Computing metrics...")
     result = InterpretabilityResult(
         name=name,
-        explanation_time=explanation_time,
         inference_latency=inference_latency,
     )
 
@@ -244,7 +242,7 @@ def benchmark_explainer(
         n_perturbations=ADVERSARIAL_N_PERTURBATIONS, seed=seed,
     )
 
-    return result
+    return result, attributions
 
 
 @dataclass

@@ -61,52 +61,46 @@ class SpladeModel(torch.nn.Module):
         self.classifier_fc1 = torch.nn.Linear(self.padded_vocab_size, CLASSIFIER_HIDDEN)
         self.classifier_fc2 = torch.nn.Linear(CLASSIFIER_HIDDEN, num_labels)
 
-    def classifier_forward(self, sparse_vector: torch.Tensor) -> torch.Tensor:
-        """ReLU MLP classifier: fc1 -> ReLU -> fc2."""
-        hidden = self.classifier_fc1(sparse_vector)
-        hidden = torch.relu(hidden)
-        return self.classifier_fc2(hidden)
-
-    def compute_effective_weights(
+    def classifier_forward(
         self, sparse_vector: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute W_eff(s) = W2 @ diag(D(s)) @ W1 for exact DLA.
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """ReLU MLP classifier returning logits and exact DLA weights.
 
-        For a ReLU MLP, the activation mask D(s) makes the network
-        piecewise linear. W_eff gives exact per-dimension attribution:
+        Computes fc1 -> ReLU -> fc2 for logits, and derives W_eff from the
+        same activation mask (single fc1 computation):
+            W_eff(s) = W2 @ diag(D(s)) @ W1
             logit_c = sum_j s_j * W_eff[c,j] + b_eff_c
 
-        Args:
-            sparse_vector: [batch, V] sparse activations.
-
         Returns:
-            W_eff: [batch, C, V] effective weight matrix.
-            b_eff: [batch, C] effective bias vector.
+            logits: [B, C] classification logits.
+            W_eff: [B, C, V] effective weight matrix for exact DLA.
+            b_eff: [B, C] effective bias vector.
         """
-        with torch.no_grad():
-            pre_relu = self.classifier_fc1(sparse_vector)
-            activation_mask = (pre_relu > 0).float()
+        pre_relu = self.classifier_fc1(sparse_vector)
+        activation_mask = (pre_relu > 0).float()
+        hidden = pre_relu * activation_mask
+        logits = self.classifier_fc2(hidden)
 
         W1 = self.classifier_fc1.weight  # [H, V]
         W2 = self.classifier_fc2.weight  # [C, H]
         b1 = self.classifier_fc1.bias    # [H]
         b2 = self.classifier_fc2.bias    # [C]
 
-        # masked_W1[batch, H, V] = mask[:,:,None] * W1[None,:,:]
         masked_W1 = activation_mask.unsqueeze(-1) * W1.unsqueeze(0)
-        # W_eff[batch, C, V] = W2 @ masked_W1
         W_eff = torch.matmul(W2.unsqueeze(0), masked_W1)
-        # b_eff[batch, C] = W2 @ (mask * b1) + b2
         b_eff = torch.matmul(activation_mask * b1, W2.T) + b2
 
-        return W_eff, b_eff
+        return logits, W_eff, b_eff
+
+    def classifier_logits_only(self, sparse_vector: torch.Tensor) -> torch.Tensor:
+        """ReLU MLP classifier returning only logits (for masked/patched evaluation)."""
+        return self.classifier_fc2(torch.relu(self.classifier_fc1(sparse_vector)))
 
     def _splade_head(
         self,
         hidden: torch.Tensor,
         attention_mask: torch.Tensor,
-        return_intermediates: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         transformed = self.vocab_transform(hidden)
         transformed = torch.nn.functional.gelu(transformed)
         transformed = self.vocab_layer_norm(transformed)
@@ -122,31 +116,19 @@ class SpladeModel(torch.nn.Module):
         assert sparse_vector.shape[-1] == self.padded_vocab_size, (
             f"Sparse vector dim {sparse_vector.shape[-1]} != padded_vocab_size {self.padded_vocab_size}"
         )
-        logits = self.classifier_forward(sparse_vector)
+        logits, W_eff, b_eff = self.classifier_forward(sparse_vector)
 
-        if return_intermediates:
-            intermediates = {
-                "post_transform": transformed,
-                "post_projection": mlm_logits,
-                "post_drelu": activated,
-                "post_log1p": log_activations,
-                "sparse_vector": sparse_vector,
-                "logits": logits,
-            }
-            return logits, sparse_vector, intermediates
-
-        return logits, sparse_vector
+        return logits, sparse_vector, W_eff, b_eff
 
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        return_intermediates: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         hidden = self.bert(
             input_ids=input_ids, attention_mask=attention_mask
         ).last_hidden_state
-        return self._splade_head(hidden, attention_mask, return_intermediates=return_intermediates)
+        return self._splade_head(hidden, attention_mask)
 
     def get_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.bert.embeddings(input_ids)
@@ -155,9 +137,8 @@ class SpladeModel(torch.nn.Module):
         self,
         embeddings: torch.Tensor,
         attention_mask: torch.Tensor,
-        return_intermediates: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         hidden = self.bert(
             inputs_embeds=embeddings, attention_mask=attention_mask
         ).last_hidden_state
-        return self._splade_head(hidden, attention_mask, return_intermediates=return_intermediates)
+        return self._splade_head(hidden, attention_mask)

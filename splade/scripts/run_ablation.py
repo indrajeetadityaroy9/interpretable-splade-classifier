@@ -43,18 +43,14 @@ def main() -> None:
     seed = config.evaluation.seeds[0]
 
     # Variant 1: Baseline — zero all circuit lambdas
+    # (DF-FLOPS is always active via SatLambdaSchedule, not a patchable constant,
+    #  so "Baseline" and "DF-FLOPS only" are equivalent)
     with patch.object(constants, "CIRCUIT_COMPLETENESS_LAMBDA", 0.0), \
          patch.object(constants, "CIRCUIT_SEPARATION_LAMBDA", 0.0), \
          patch.object(constants, "CIRCUIT_SHARPNESS_LAMBDA", 0.0):
         _run_variant(config, seed, "Baseline (no circuit losses)")
 
-    # Variant 2: DF-FLOPS only — zero circuit lambdas, keep DF-FLOPS
-    with patch.object(constants, "CIRCUIT_COMPLETENESS_LAMBDA", 0.0), \
-         patch.object(constants, "CIRCUIT_SEPARATION_LAMBDA", 0.0), \
-         patch.object(constants, "CIRCUIT_SHARPNESS_LAMBDA", 0.0):
-        _run_variant(config, seed, "DF-FLOPS only")
-
-    # Variant 3: Full CIS — default constants
+    # Variant 2: Full CIS — default constants
     _run_variant(config, seed, "Full CIS")
 
 

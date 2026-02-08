@@ -78,7 +78,7 @@ class LIMEExplainer(BaseExplainer):
                 padding="max_length", truncation=True, return_tensors="pt",
             )
             with torch.inference_mode(), torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
-                logits, _ = _model(
+                logits, _, _, _ = _model(
                     encoding["input_ids"].to(DEVICE),
                     encoding["attention_mask"].to(DEVICE),
                 )
@@ -117,11 +117,11 @@ class IntegratedGradientsExplainer(BaseExplainer):
         baseline = torch.zeros_like(embeddings)
 
         def forward_fn(embeds, mask):
-            logits, _ = _model.forward_from_embeddings(embeds, mask)
+            logits, _, _, _ = _model.forward_from_embeddings(embeds, mask)
             return logits
 
         with torch.inference_mode():
-            logits, _ = _model(input_ids, attention_mask)
+            logits, _, _, _ = _model(input_ids, attention_mask)
         target = int(logits.argmax(dim=-1).item())
 
         ig = IntegratedGradients(forward_fn)
@@ -155,11 +155,11 @@ class GradientShapExplainer(BaseExplainer):
         baselines = torch.zeros(self.n_samples, *embeddings.shape[1:], device=DEVICE)
 
         def forward_fn(embeds, mask):
-            logits, _ = _model.forward_from_embeddings(embeds, mask)
+            logits, _, _, _ = _model.forward_from_embeddings(embeds, mask)
             return logits
 
         with torch.inference_mode():
-            logits, _ = _model(input_ids, attention_mask)
+            logits, _, _, _ = _model(input_ids, attention_mask)
         target = int(logits.argmax(dim=-1).item())
 
         gs = GradientShap(forward_fn)
@@ -232,11 +232,11 @@ class SaliencyExplainer(BaseExplainer):
         embeddings = _model.get_embeddings(input_ids)
 
         def forward_fn(embeds, mask):
-            logits, _ = _model.forward_from_embeddings(embeds, mask)
+            logits, _, _, _ = _model.forward_from_embeddings(embeds, mask)
             return logits
 
         with torch.inference_mode():
-            logits, _ = _model(input_ids, attention_mask)
+            logits, _, _, _ = _model(input_ids, attention_mask)
         target = int(logits.argmax(dim=-1).item())
 
         saliency = Saliency(forward_fn)
@@ -269,11 +269,11 @@ class DeepLiftExplainer(BaseExplainer):
         baseline = torch.zeros_like(embeddings)
 
         def forward_fn(embeds, mask):
-            logits, _ = _model.forward_from_embeddings(embeds, mask)
+            logits, _, _, _ = _model.forward_from_embeddings(embeds, mask)
             return logits
 
         with torch.inference_mode():
-            logits, _ = _model(input_ids, attention_mask)
+            logits, _, _, _ = _model(input_ids, attention_mask)
         target = int(logits.argmax(dim=-1).item())
 
         dl = DeepLift(forward_fn)

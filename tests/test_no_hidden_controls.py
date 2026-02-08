@@ -50,4 +50,4 @@ def test_cis_hardwired():
     params = list(sig.parameters.keys())
     assert "use_df_weighting" not in params, "train_model should not have use_df_weighting param"
     assert "circuit_aware" not in params, "train_model should not have circuit_aware param"
-    assert len(params) == 8, f"train_model should have 8 params, got {len(params)}: {params}"
+    assert len(params) == 10, f"train_model should have 10 params, got {len(params)}: {params}"

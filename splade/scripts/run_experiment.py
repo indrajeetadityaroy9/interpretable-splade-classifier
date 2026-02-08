@@ -9,30 +9,25 @@ import json
 import os
 from dataclasses import asdict
 
-import torch
 import yaml
 
 from splade.config.load import load_config
 from splade.config.schema import Config
 from splade.evaluation.benchmark import (ExperimentResults,
-                                         InterpretabilityResult,
                                          aggregate_results,
                                          benchmark_explainer,
                                          print_aggregated_results,
                                          print_experiment_results)
-from splade.evaluation.constants import K_MAX
 from splade.evaluation.explainers import EXPLAINER_REGISTRY
 from splade.evaluation.f_fidelity import finetune_surrogate_model
 from splade.evaluation.faithfulness import UnigramSampler
 from splade.evaluation.integration import analyze_circuit_faithfulness_alignment
 from splade.evaluation.mechanistic import (print_mechanistic_results,
                                            run_mechanistic_evaluation)
-from splade.evaluation.token_alignment import normalize_attributions_to_words
 from splade.inference import explain_model, explain_model_batch
 from splade.pipelines import (PredictorWrapper, prepare_mechanistic_inputs,
                               setup_and_train)
 from splade.training.constants import FRAMEWORK_NAME
-from splade.utils.cuda import COMPUTE_DTYPE, DEVICE
 
 
 def _print_cis_config(config: Config) -> None:
@@ -85,6 +80,7 @@ def run_experiment(config: Config) -> list[ExperimentResults]:
             exp.test_labels, exp.tokenizer, num_classes=exp.num_labels,
             circuit_threshold=config.mechanistic.circuit_threshold,
             run_sae_comparison=config.mechanistic.sae_comparison,
+            centroid_tracker=exp.centroid_tracker,
         )
 
         experiment.dla_verification_error = mechanistic_results.dla_verification_error
@@ -142,7 +138,7 @@ def run_experiment(config: Config) -> list[ExperimentResults]:
                 batch_explain_fn = _make_batch_explain()
                 display_name = explainer_name.upper()
 
-            result = benchmark_explainer(
+            result, word_attributions = benchmark_explainer(
                 predictor, display_name, explain_fn, batch_explain_fn,
                 exp.test_texts, mask_token=mask_token, seed=seed,
                 sampler=sampler, tokenizer=exp.tokenizer, max_length=exp.max_length,
@@ -150,12 +146,7 @@ def run_experiment(config: Config) -> list[ExperimentResults]:
             )
             result.accuracy = exp.accuracy
             experiment.explainer_results.append(result)
-
-            raw = batch_explain_fn(exp.test_texts, K_MAX)
-            attributions_per_explainer[display_name] = [
-                normalize_attributions_to_words(text, attrib, exp.tokenizer)
-                for text, attrib in zip(exp.test_texts, raw)
-            ]
+            attributions_per_explainer[display_name] = word_attributions
 
         # Phase 3: Integration Analysis
         if mechanistic_results.circuits:

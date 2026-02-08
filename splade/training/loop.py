@@ -1,4 +1,3 @@
-import copy
 import os
 
 import torch
@@ -84,9 +83,13 @@ def train_model(
     num_labels: int,
     val_texts: list[str],
     val_labels: list[int],
-) -> None:
-    max_length = infer_max_length(texts, tokenizer)
-    batch_size = _infer_batch_size(model_name, max_length)
+    max_length: int | None = None,
+    batch_size: int | None = None,
+) -> "AttributionCentroidTracker":
+    if max_length is None:
+        max_length = infer_max_length(texts, tokenizer)
+    if batch_size is None:
+        batch_size = _infer_batch_size(model_name, max_length)
 
     print(f"Auto-inferred: max_length={max_length}, batch_size={batch_size}")
 
@@ -186,7 +189,7 @@ def train_model(
             optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
-                logits, sparse = model(batch_ids, batch_mask)
+                logits, sparse, W_eff, _ = model(batch_ids, batch_mask)
                 classification_loss = (
                     criterion(logits.squeeze(-1), batch_labels)
                     if num_labels == 1
@@ -203,10 +206,9 @@ def train_model(
                 # CIS circuit losses
                 circuit_weight = circuit_schedule.step()
                 if circuit_weight > 0:
-                    W_eff, _ = _orig.compute_effective_weights(sparse)
                     cc_loss = compute_circuit_completeness_loss(
                         sparse, W_eff, batch_labels.view(-1),
-                        _orig.classifier_forward,
+                        _orig.classifier_logits_only,
                         CIRCUIT_FRACTION, CIRCUIT_TEMPERATURE,
                     )
                     sep_loss = compute_circuit_separation_loss(centroid_tracker)
@@ -249,7 +251,7 @@ def train_model(
         model.eval()
         with torch.inference_mode():
             with torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
-                val_logits, _ = model(val_ids_gpu, val_mask_gpu)
+                val_logits, _, _, _ = model(val_ids_gpu, val_mask_gpu)
                 val_loss = (
                     criterion(val_logits.squeeze(-1), val_label_gpu)
                     if num_labels == 1
@@ -282,3 +284,5 @@ def train_model(
     print(f"Applied best EMA weights (val loss: {best_val_loss:.4f})")
 
     model.eval()
+
+    return centroid_tracker

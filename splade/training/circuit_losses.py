@@ -24,6 +24,7 @@ from typing import Callable
 import torch
 import torch.nn.functional as F
 
+from splade.mechanistic.attribution import compute_attribution_tensor
 from splade.training.constants import (
     CENTROID_MOMENTUM,
     CIRCUIT_FRACTION,
@@ -70,8 +71,9 @@ class AttributionCentroidTracker:
             if not mask.any():
                 continue
             class_sparse = sparse_vector[mask]
-            class_weights = W_eff[mask, c, :]
-            attr = (class_sparse * class_weights).abs().mean(dim=0)
+            class_W_eff = W_eff[mask]
+            class_labels = torch.full((class_sparse.shape[0],), c, device=sparse_vector.device)
+            attr = compute_attribution_tensor(class_sparse, class_W_eff, class_labels).abs().mean(dim=0)
             if self._initialized[c]:
                 self.centroids[c].lerp_(attr, 1.0 - self.momentum)
             else:
@@ -136,9 +138,7 @@ def compute_circuit_completeness_loss(
         Scalar loss.
     """
     # Per-sample DLA attribution for the target class
-    batch_indices = torch.arange(sparse_vector.shape[0], device=sparse_vector.device)
-    target_weights = W_eff[batch_indices, labels, :]  # [batch, V]
-    attr_magnitude = (sparse_vector * target_weights).abs()
+    attr_magnitude = compute_attribution_tensor(sparse_vector, W_eff, labels).abs()
 
     # Soft top-k: keep top circuit_fraction of dimensions
     k = max(1, int(circuit_fraction * sparse_vector.shape[-1]))
@@ -201,9 +201,7 @@ def compute_attribution_sharpness_loss(
     Returns:
         Scalar loss (1 - mean Gini).
     """
-    batch_indices = torch.arange(sparse_vector.shape[0], device=sparse_vector.device)
-    target_weights = W_eff[batch_indices, labels, :]
-    attr = (sparse_vector * target_weights).abs()
+    attr = compute_attribution_tensor(sparse_vector, W_eff, labels).abs()
 
     # Sort ascending for Gini computation
     sorted_attr, _ = attr.sort(dim=-1)

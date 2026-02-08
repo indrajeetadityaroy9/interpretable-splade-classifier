@@ -10,6 +10,7 @@ import torch
 from transformers import AutoTokenizer
 
 from splade.config.schema import Config
+from splade.training.circuit_losses import AttributionCentroidTracker
 from splade.data.loader import infer_max_length, load_dataset_by_name
 from splade.inference import score_model
 from splade.models.splade import SpladeModel
@@ -31,6 +32,7 @@ class TrainedExperiment:
     batch_size: int
     accuracy: float
     seed: int
+    centroid_tracker: AttributionCentroidTracker | None = None
 
 
 def setup_and_train(config: Config, seed: int) -> TrainedExperiment:
@@ -57,10 +59,11 @@ def setup_and_train(config: Config, seed: int) -> TrainedExperiment:
     model = SpladeModel(config.model.name, num_labels).to(DEVICE)
     model = torch.compile(model, mode="max-autotune")
 
-    train_model(
+    centroid_tracker = train_model(
         model, tokenizer, train_texts_split, train_labels_split,
         model_name=config.model.name, num_labels=num_labels,
         val_texts=val_texts, val_labels=val_labels,
+        max_length=max_length, batch_size=batch_size,
     )
 
     accuracy = score_model(
@@ -80,6 +83,7 @@ def setup_and_train(config: Config, seed: int) -> TrainedExperiment:
         batch_size=batch_size,
         accuracy=accuracy,
         seed=seed,
+        centroid_tracker=centroid_tracker,
     )
 
 
@@ -109,7 +113,7 @@ class PredictorWrapper:
 
     def predict_proba_from_embeddings(self, embeddings, attention_mask):
         with torch.inference_mode(), torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
-            logits, _ = unwrap_compiled(self.model).forward_from_embeddings(embeddings, attention_mask)
+            logits, _, _, _ = unwrap_compiled(self.model).forward_from_embeddings(embeddings, attention_mask)
         return torch.nn.functional.softmax(logits, dim=-1)
 
 

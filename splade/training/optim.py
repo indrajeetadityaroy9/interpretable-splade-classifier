@@ -8,8 +8,7 @@ from transformers import AutoConfig
 
 from splade.training.constants import (AGC_CLIP_FACTOR, AGC_EPS,
                                        LR_FIND_DIVERGE_FACTOR, LR_FIND_END,
-                                       LR_FIND_STEPS, WARMUP_RATIO,
-                                       WEIGHT_DECAY)
+                                       LR_FIND_STEPS, WEIGHT_DECAY)
 from splade.utils.cuda import COMPUTE_DTYPE, DEVICE, unwrap_compiled
 
 
@@ -48,7 +47,7 @@ def find_lr(
 
         temp_optimizer.zero_grad(set_to_none=True)
         with torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
-            logits, _ = model(batch_ids, batch_mask)
+            logits, _, _, _ = model(batch_ids, batch_mask)
             loss = (
                 criterion(logits.squeeze(-1), batch_labels)
                 if num_labels == 1
