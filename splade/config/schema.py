@@ -15,12 +15,20 @@ class ModelConfig:
 
 
 @dataclass
+class MechanisticConfig:
+    enabled: bool = False
+    circuit_threshold: float = 0.01
+    ablation_samples: int = 100
+
+
+@dataclass
+class TrainingConfig:
+    use_df_weighting: bool = True
+
+
+@dataclass
 class EvaluationConfig:
     seeds: List[int] = field(default_factory=lambda: [42])
-    explainers: List[str] = field(default_factory=lambda: [
-        "splade", "lime", "ig", "gradient_shap", "attention",
-        "saliency", "deeplift", "random",
-    ])
 
 
 @dataclass
@@ -30,3 +38,5 @@ class Config:
     data: DataConfig
     model: ModelConfig
     evaluation: EvaluationConfig
+    mechanistic: MechanisticConfig = field(default_factory=MechanisticConfig)
+    training: TrainingConfig = field(default_factory=TrainingConfig)

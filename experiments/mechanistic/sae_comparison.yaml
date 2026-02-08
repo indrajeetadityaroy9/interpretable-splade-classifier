@@ -1,0 +1,13 @@
+experiment_name: "sae_comparison"
+output_dir: "results/mechanistic/sae_comparison"
+
+data:
+  dataset_name: "sst2"
+  train_samples: 2000
+  test_samples: 200
+
+model:
+  name: "distilbert-base-uncased"
+
+evaluation:
+  seeds: [42]

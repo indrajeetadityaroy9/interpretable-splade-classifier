@@ -63,7 +63,8 @@ class SpladeModel(torch.nn.Module):
         self,
         hidden: torch.Tensor,
         attention_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return_intermediates: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         transformed = self.vocab_transform(hidden)
         transformed = torch.nn.functional.gelu(transformed)
         transformed = self.vocab_layer_norm(transformed)
@@ -76,18 +77,31 @@ class SpladeModel(torch.nn.Module):
             ~attention_mask.unsqueeze(-1).bool(), 0.0
         )
         sparse_vector = masked_activations.max(dim=1).values
+        logits = self.classifier(sparse_vector)
 
-        return self.classifier(sparse_vector), sparse_vector
+        if return_intermediates:
+            intermediates = {
+                "post_transform": transformed,
+                "post_projection": mlm_logits,
+                "post_drelu": activated,
+                "post_log1p": log_activations,
+                "sparse_vector": sparse_vector,
+                "logits": logits,
+            }
+            return logits, sparse_vector, intermediates
+
+        return logits, sparse_vector
 
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return_intermediates: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         hidden = self.bert(
             input_ids=input_ids, attention_mask=attention_mask
         ).last_hidden_state
-        return self._splade_head(hidden, attention_mask)
+        return self._splade_head(hidden, attention_mask, return_intermediates=return_intermediates)
 
     def get_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.bert.embeddings(input_ids)
@@ -96,8 +110,9 @@ class SpladeModel(torch.nn.Module):
         self,
         embeddings: torch.Tensor,
         attention_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return_intermediates: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         hidden = self.bert(
             inputs_embeds=embeddings, attention_mask=attention_mask
         ).last_hidden_state
-        return self._splade_head(hidden, attention_mask)
+        return self._splade_head(hidden, attention_mask, return_intermediates=return_intermediates)

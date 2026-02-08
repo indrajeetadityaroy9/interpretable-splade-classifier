@@ -10,7 +10,9 @@ from transformers import AutoTokenizer
 from splade.data.loader import infer_max_length
 from splade.training.constants import (EARLY_STOP_PATIENCE, EMA_DECAY,
                                        LABEL_SMOOTHING, MAX_EPOCHS)
-from splade.training.losses import DFFlopsRegFunction, DocumentFrequencyTracker
+from splade.training.losses import (DFFlopsRegFunction,
+                                    DocumentFrequencyTracker,
+                                    VanillaFlopsRegFunction)
 from splade.training.optim import (_adaptive_gradient_clip,
                                    _build_param_groups, _compute_warmup_steps,
                                    _infer_batch_size, _LRScheduler, find_lr)
@@ -66,6 +68,7 @@ def train_model(
     num_labels: int,
     val_texts: list[str],
     val_labels: list[int],
+    use_df_weighting: bool = True,
 ) -> None:
     max_length = infer_max_length(texts, tokenizer)
     batch_size = _infer_batch_size(model_name, max_length)
@@ -171,8 +174,11 @@ def train_model(
                 )
 
                 df_tracker.update(sparse)
-                df_weights = df_tracker.get_weights()
-                regularization_loss = DFFlopsRegFunction.apply(sparse, df_weights)
+                if use_df_weighting:
+                    df_weights = df_tracker.get_weights()
+                    regularization_loss = DFFlopsRegFunction.apply(sparse, df_weights)
+                else:
+                    regularization_loss = VanillaFlopsRegFunction.apply(sparse)
 
                 regularization_weight = lambda_schedule.compute_lambda(sparse)
                 loss = classification_loss + regularization_weight * regularization_loss

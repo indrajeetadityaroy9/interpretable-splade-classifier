@@ -10,21 +10,17 @@ from transformers import AutoTokenizer
 from splade.config.load import load_config
 from splade.config.schema import Config
 from splade.data.loader import infer_max_length, load_dataset_by_name
-from splade.evaluation.adversarial import (CharacterAttack, TextFoolerAttack,
-                                           WordNetAttack)
 from splade.evaluation.benchmark import (aggregate_results,
                                          benchmark_explainer,
                                          print_aggregated_results,
                                          print_interpretability_results)
-from splade.evaluation.constants import ADVERSARIAL_MAX_CHANGES, FFIDELITY_BETA
 from splade.evaluation.faithfulness import UnigramSampler
 from splade.inference import (explain_model, explain_model_batch,
                               predict_proba_model, score_model)
 from splade.models.splade import SpladeModel
-from splade.training.finetune import finetune_splade_for_ffidelity
 from splade.training.loop import train_model
 from splade.training.optim import _infer_batch_size
-from splade.utils.cuda import COMPUTE_DTYPE, DEVICE, set_seed
+from splade.utils.cuda import COMPUTE_DTYPE, DEVICE
 
 
 class PredictorWrapper:
@@ -72,6 +68,7 @@ def run_benchmark(config: Config) -> list:
         print(f"RUNNING BENCHMARK WITH SEED {seed}")
         print("#" * 40)
 
+        from splade.utils.cuda import set_seed
         set_seed(seed)
 
         train_texts, train_labels, test_texts, test_labels, num_labels = load_dataset_by_name(
@@ -85,10 +82,8 @@ def run_benchmark(config: Config) -> list:
         max_length = infer_max_length(train_texts, tokenizer)
         batch_size = _infer_batch_size(config.model.name, max_length)
         eval_batch_size = min(batch_size * 4, 128)
-        ft_batch_size = min(batch_size * 2, 64)
 
-        print(f"Auto-inferred: max_length={max_length}, train_batch={batch_size}, "
-              f"eval_batch={eval_batch_size}, ft_batch={ft_batch_size}")
+        print(f"Auto-inferred: max_length={max_length}, train_batch={batch_size}, eval_batch={eval_batch_size}")
 
         val_size = min(200, len(train_texts) // 5)
         val_texts_split = train_texts[-val_size:]
@@ -113,22 +108,7 @@ def run_benchmark(config: Config) -> list:
         mask_token = tokenizer.mask_token
 
         sampler = UnigramSampler(test_texts, seed=seed)
-        print("\nFine-tuning model copy for F-Fidelity...")
-
-        fine_tuned_model = finetune_splade_for_ffidelity(
-            model, tokenizer, train_texts_split, train_labels_split,
-            beta=FFIDELITY_BETA, batch_size=ft_batch_size,
-            mask_token=mask_token, seed=seed, max_length=max_length,
-        )
-
         predictor = PredictorWrapper(model, tokenizer, max_length, eval_batch_size)
-        ft_predictor = PredictorWrapper(fine_tuned_model, tokenizer, max_length, eval_batch_size)
-
-        attacks = [
-            WordNetAttack(max_changes=ADVERSARIAL_MAX_CHANGES),
-            TextFoolerAttack(predictor, max_changes=ADVERSARIAL_MAX_CHANGES),
-            CharacterAttack(max_changes=ADVERSARIAL_MAX_CHANGES),
-        ]
 
         def splade_explain_fn(text, top_k):
             return explain_model(model, tokenizer, text, max_length, top_k=top_k, input_only=True)
@@ -147,9 +127,7 @@ def run_benchmark(config: Config) -> list:
             test_texts,
             mask_token=mask_token,
             seed=seed,
-            attacks=attacks,
             sampler=sampler,
-            ftuned_clf=ft_predictor,
             tokenizer=tokenizer,
             max_length=max_length,
         )

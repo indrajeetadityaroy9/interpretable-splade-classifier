@@ -69,3 +69,24 @@ class DFFlopsRegFunction(torch.autograd.Function):
             / batch_size
         )
         return grad_activations, None
+
+
+class VanillaFlopsRegFunction(torch.autograd.Function):
+    """Vanilla FLOPS regularization (uniform weights) from SPLADE v2."""
+
+    @staticmethod
+    def forward(ctx, activations: torch.Tensor) -> torch.Tensor:
+        ctx.save_for_backward(activations)
+        mean_act = activations.abs().mean(dim=0)
+        return (mean_act ** 2).sum()
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        (activations,) = ctx.saved_tensors
+        batch_size = activations.shape[0]
+        mean_act = activations.abs().mean(dim=0)
+        sign = torch.where(activations != 0, torch.sign(activations), torch.zeros_like(activations))
+        grad_activations = (
+            grad_output * 2.0 * mean_act.unsqueeze(0) * sign / batch_size
+        )
+        return grad_activations
