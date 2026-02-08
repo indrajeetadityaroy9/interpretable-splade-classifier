@@ -2,7 +2,7 @@ from typing import Callable
 
 import torch
 
-from splade.utils.cuda import COMPUTE_DTYPE
+from splade.utils.cuda import COMPUTE_DTYPE, unwrap_compiled
 
 
 def patch_sparse_vector(
@@ -16,7 +16,7 @@ def patch_sparse_vector(
 
     Returns (original_logits, patched_logits, delta).
     """
-    _model = model._orig_mod if hasattr(model, "_orig_mod") else model
+    _model = unwrap_compiled(model)
 
     with torch.inference_mode(), torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
         original_logits, original_sparse = _model(input_ids, attention_mask)
@@ -25,7 +25,7 @@ def patch_sparse_vector(
         for idx in token_indices:
             patched_sparse[:, idx] = patch_value
 
-        patched_logits = _model.classifier(patched_sparse)
+        patched_logits = _model.classifier_forward(patched_sparse)
 
     delta = original_logits - patched_logits
     return original_logits, patched_logits, delta
@@ -41,7 +41,7 @@ def ablate_vocabulary_tokens(
 
     Returns a dict mapping token_id -> logit delta for the predicted class.
     """
-    _model = model._orig_mod if hasattr(model, "_orig_mod") else model
+    _model = unwrap_compiled(model)
 
     with torch.inference_mode(), torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
         original_logits, sparse_vector = _model(input_ids, attention_mask)
@@ -66,7 +66,7 @@ def patch_activation(
 
     Returns the logits after patching.
     """
-    _model = model._orig_mod if hasattr(model, "_orig_mod") else model
+    _model = unwrap_compiled(model)
 
     target_module = None
     for name, module in _model.named_modules():

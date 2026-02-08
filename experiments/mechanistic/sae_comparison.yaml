@@ -11,3 +11,6 @@ model:
 
 evaluation:
   seeds: [42]
+
+mechanistic:
+  sae_comparison: true

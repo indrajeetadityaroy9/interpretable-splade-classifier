@@ -1,21 +1,22 @@
 from dataclasses import dataclass
 
-import numpy
 import torch
+
+from splade.utils.cuda import DEVICE
 
 
 @dataclass
 class VocabularyAttribution:
-    token_ids: numpy.ndarray
+    token_ids: list[int]
     token_names: list[str]
-    attribution_scores: numpy.ndarray
+    attribution_scores: list[float]
     class_idx: int
     logit: float
 
 
 def compute_direct_logit_attribution(
-    sparse_vector: torch.Tensor | numpy.ndarray,
-    classifier_weight: torch.Tensor | numpy.ndarray,
+    sparse_vector: torch.Tensor,
+    classifier_weight: torch.Tensor,
     tokenizer,
     class_idx: int,
 ) -> VocabularyAttribution:
@@ -23,11 +24,11 @@ def compute_direct_logit_attribution(
 
     The sum of attribution scores exactly equals the logit for the target class
     (verifiable invariant, ignoring classifier bias).
+
+    All computation stays on GPU. Results are converted to Python types at the boundary.
     """
-    if isinstance(sparse_vector, torch.Tensor):
-        sparse_vector = sparse_vector.detach().cpu().numpy()
-    if isinstance(classifier_weight, torch.Tensor):
-        classifier_weight = classifier_weight.detach().cpu().numpy()
+    sparse_vector = sparse_vector.to(DEVICE)
+    classifier_weight = classifier_weight.to(DEVICE)
 
     if classifier_weight.ndim == 2:
         weights = classifier_weight[class_idx]
@@ -36,55 +37,21 @@ def compute_direct_logit_attribution(
 
     attributions = sparse_vector * weights
     nonzero_mask = attributions != 0
-    token_ids = numpy.where(nonzero_mask)[0]
+    token_ids = torch.where(nonzero_mask)[0]
 
-    sorted_indices = numpy.argsort(numpy.abs(attributions[token_ids]))[::-1]
+    sorted_indices = torch.argsort(attributions[token_ids].abs(), descending=True)
     token_ids = token_ids[sorted_indices]
     scores = attributions[token_ids]
 
-    token_names = tokenizer.convert_ids_to_tokens(token_ids.tolist())
+    token_ids_list = token_ids.tolist()
+    token_names = tokenizer.convert_ids_to_tokens(token_ids_list)
 
     return VocabularyAttribution(
-        token_ids=token_ids,
+        token_ids=token_ids_list,
         token_names=token_names,
-        attribution_scores=scores,
+        attribution_scores=scores.tolist(),
         class_idx=class_idx,
-        logit=float(attributions.sum()),
+        logit=float(attributions.sum().item()),
     )
 
 
-def compute_contrastive_attribution(
-    sparse_vector: torch.Tensor | numpy.ndarray,
-    classifier_weight: torch.Tensor | numpy.ndarray,
-    tokenizer,
-    class_a: int,
-    class_b: int,
-) -> VocabularyAttribution:
-    """Compute contrastive attribution: difference between class_a and class_b attributions.
-
-    Positive scores favor class_a, negative scores favor class_b.
-    """
-    if isinstance(sparse_vector, torch.Tensor):
-        sparse_vector = sparse_vector.detach().cpu().numpy()
-    if isinstance(classifier_weight, torch.Tensor):
-        classifier_weight = classifier_weight.detach().cpu().numpy()
-
-    diff_weights = classifier_weight[class_a] - classifier_weight[class_b]
-    attributions = sparse_vector * diff_weights
-
-    nonzero_mask = attributions != 0
-    token_ids = numpy.where(nonzero_mask)[0]
-
-    sorted_indices = numpy.argsort(numpy.abs(attributions[token_ids]))[::-1]
-    token_ids = token_ids[sorted_indices]
-    scores = attributions[token_ids]
-
-    token_names = tokenizer.convert_ids_to_tokens(token_ids.tolist())
-
-    return VocabularyAttribution(
-        token_ids=token_ids,
-        token_names=token_names,
-        attribution_scores=scores,
-        class_idx=class_a,
-        logit=float(attributions.sum()),
-    )

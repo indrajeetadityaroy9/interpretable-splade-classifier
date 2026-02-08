@@ -1,5 +1,4 @@
 from dataclasses import dataclass, field
-from typing import List
 
 
 @dataclass
@@ -16,19 +15,14 @@ class ModelConfig:
 
 @dataclass
 class MechanisticConfig:
-    enabled: bool = False
     circuit_threshold: float = 0.01
-    ablation_samples: int = 100
-
-
-@dataclass
-class TrainingConfig:
-    use_df_weighting: bool = True
+    sae_comparison: bool = False
 
 
 @dataclass
 class EvaluationConfig:
-    seeds: List[int] = field(default_factory=lambda: [42])
+    seeds: list[int] = field(default_factory=lambda: [42])
+    explainers: list[str] = field(default_factory=lambda: ["splade"])
 
 
 @dataclass
@@ -39,4 +33,3 @@ class Config:
     model: ModelConfig
     evaluation: EvaluationConfig
     mechanistic: MechanisticConfig = field(default_factory=MechanisticConfig)
-    training: TrainingConfig = field(default_factory=TrainingConfig)

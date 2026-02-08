@@ -1,17 +1,15 @@
-import numpy
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from splade.utils.cuda import COMPUTE_DTYPE, DEVICE
-
-SPECIAL_TOKENS = {"[CLS]", "[SEP]", "[UNK]", "[MASK]", "[PAD]"}
+from splade.evaluation.constants import SPECIAL_TOKENS
+from splade.utils.cuda import COMPUTE_DTYPE, DEVICE, unwrap_compiled
 
 def _run_inference_loop(
     model: torch.nn.Module,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     extract_sparse: bool = False,
-    batch_size: int = 32, 
+    batch_size: int = 32,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     loader = DataLoader(
         TensorDataset(input_ids, attention_mask),
@@ -28,9 +26,9 @@ def _run_inference_loop(
             batch_ids = batch_ids.to(DEVICE, non_blocking=True)
             batch_mask = batch_mask.to(DEVICE, non_blocking=True)
             logits, sparse = model(batch_ids, batch_mask)
-            all_logits.append(logits.cpu())
+            all_logits.append(logits)
             if extract_sparse:
-                all_sparse.append(sparse.cpu())
+                all_sparse.append(sparse)
 
     logits = torch.cat(all_logits, dim=0)
     sparse = torch.cat(all_sparse, dim=0) if extract_sparse else None
@@ -57,10 +55,6 @@ def score_model(model, tokenizer, texts: list[str], labels: list[int], max_lengt
     preds = predict_model(model, tokenizer, texts, max_length, batch_size, num_labels)
     return sum(p == t for p, t in zip(preds, labels)) / len(labels)
 
-def transform_model(model, tokenizer, texts: list[str], max_length: int, batch_size: int = 32) -> numpy.ndarray:
-    encoding = tokenizer(texts, max_length=max_length, padding="max_length", truncation=True, return_tensors="pt")
-    _, sparse = _run_inference_loop(model, encoding["input_ids"], encoding["attention_mask"], extract_sparse=True, batch_size=batch_size)
-    return sparse.numpy()
 
 def explain_model(
     model: torch.nn.Module,
@@ -76,34 +70,43 @@ def explain_model(
         model, encoding["input_ids"], encoding["attention_mask"],
         extract_sparse=True, batch_size=1,
     )
-    sparse_vector = sparse[0].numpy()
+    sparse_vector = sparse[0]
 
     if target_class is None:
         probabilities = torch.nn.functional.softmax(logits, dim=-1)
         target_class = int(probabilities[0].argmax().item())
 
     with torch.inference_mode():
-        weights = model._orig_mod.classifier.weight[target_class].cpu().numpy()
+        _model = unwrap_compiled(model)
+        W_eff, _ = _model.compute_effective_weights(sparse_vector.unsqueeze(0))
+        weights = W_eff[0, target_class]
 
     contributions = sparse_vector * weights
-    nonzero_indices = numpy.nonzero(contributions)[0]
+    nonzero_indices = contributions.nonzero(as_tuple=True)[0]
 
     if input_only:
         input_ids = set(tokenizer.encode(text, add_special_tokens=False))
-        nonzero_indices = numpy.array([i for i in nonzero_indices if i in input_ids])
+        mask = torch.tensor([i.item() in input_ids for i in nonzero_indices], dtype=torch.bool, device=DEVICE)
+        nonzero_indices = nonzero_indices[mask]
 
-    positive_mask = contributions[nonzero_indices] > 0
+    contrib_vals = contributions[nonzero_indices]
+    positive_mask = contrib_vals > 0
     positive_indices = nonzero_indices[positive_mask]
     negative_indices = nonzero_indices[~positive_mask]
-    positive_indices = positive_indices[numpy.argsort(contributions[positive_indices])[::-1]]
-    negative_indices = negative_indices[numpy.argsort(numpy.abs(contributions[negative_indices]))[::-1]]
-    ranked_indices = numpy.concatenate([positive_indices, negative_indices])
+
+    pos_order = torch.argsort(contributions[positive_indices], descending=True)
+    positive_indices = positive_indices[pos_order]
+    neg_order = torch.argsort(contributions[negative_indices].abs(), descending=True)
+    negative_indices = negative_indices[neg_order]
+
+    ranked_indices = torch.cat([positive_indices, negative_indices])
 
     explanations = []
     for index in ranked_indices:
-        token = tokenizer.convert_ids_to_tokens(int(index))
+        idx_int = index.item()
+        token = tokenizer.convert_ids_to_tokens(idx_int)
         if token not in SPECIAL_TOKENS:
-            explanations.append((token, float(contributions[index])))
+            explanations.append((token, float(contributions[idx_int].item())))
         if len(explanations) >= top_k:
             break
 
@@ -125,11 +128,11 @@ def explain_model_batch(
         extract_sparse=True, batch_size=batch_size,
     )
     probabilities = torch.nn.functional.softmax(logits, dim=-1)
-    sparse_np = sparse.numpy()
     target_classes = probabilities.argmax(dim=-1).tolist()
 
     with torch.inference_mode():
-        all_weights = model._orig_mod.classifier.weight.cpu().numpy()
+        _model = unwrap_compiled(model)
+        W_eff, _ = _model.compute_effective_weights(sparse)
 
     input_id_sets = None
     if input_only:
@@ -140,29 +143,39 @@ def explain_model_batch(
     all_explanations = []
     for idx in range(len(texts)):
         target_class = target_classes[idx]
-        weights = all_weights[target_class]
-        contributions = sparse_np[idx] * weights
-        nonzero_indices = numpy.nonzero(contributions)[0]
+        weights = W_eff[idx, target_class]
+        contributions = sparse[idx] * weights
+        nonzero_indices = contributions.nonzero(as_tuple=True)[0]
 
         if input_only and input_id_sets is not None:
-            nonzero_indices = numpy.array([i for i in nonzero_indices if i in input_id_sets[idx]])
+            mask = torch.tensor(
+                [i.item() in input_id_sets[idx] for i in nonzero_indices],
+                dtype=torch.bool, device=DEVICE,
+            )
+            nonzero_indices = nonzero_indices[mask]
 
         if len(nonzero_indices) == 0:
             all_explanations.append([])
             continue
 
-        positive_mask = contributions[nonzero_indices] > 0
+        contrib_vals = contributions[nonzero_indices]
+        positive_mask = contrib_vals > 0
         positive_indices = nonzero_indices[positive_mask]
         negative_indices = nonzero_indices[~positive_mask]
-        positive_indices = positive_indices[numpy.argsort(contributions[positive_indices])[::-1]]
-        negative_indices = negative_indices[numpy.argsort(numpy.abs(contributions[negative_indices]))[::-1]]
-        ranked_indices = numpy.concatenate([positive_indices, negative_indices])
+
+        pos_order = torch.argsort(contributions[positive_indices], descending=True)
+        positive_indices = positive_indices[pos_order]
+        neg_order = torch.argsort(contributions[negative_indices].abs(), descending=True)
+        negative_indices = negative_indices[neg_order]
+
+        ranked_indices = torch.cat([positive_indices, negative_indices])
 
         explanations = []
         for index in ranked_indices:
-            token = tokenizer.convert_ids_to_tokens(int(index))
+            idx_int = index.item()
+            token = tokenizer.convert_ids_to_tokens(idx_int)
             if token not in SPECIAL_TOKENS:
-                explanations.append((token, float(contributions[index])))
+                explanations.append((token, float(contributions[idx_int].item())))
             if len(explanations) >= top_k:
                 break
         all_explanations.append(explanations)

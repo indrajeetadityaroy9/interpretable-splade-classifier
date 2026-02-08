@@ -4,12 +4,11 @@ Reference: Cunningham et al. (2023) "Sparse Autoencoders Find Highly Interpretab
 Features in Language Models" (arXiv:2309.08600).
 """
 
-import numpy
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from splade.utils.cuda import COMPUTE_DTYPE, DEVICE
+from splade.utils.cuda import COMPUTE_DTYPE, DEVICE, unwrap_compiled
 
 
 class SimpleSAE(nn.Module):
@@ -47,9 +46,9 @@ def train_sae_on_splade(
     Collects hidden states from the model's vocab_transform output,
     then trains an overcomplete SAE to reconstruct them.
     """
-    _model = model._orig_mod if hasattr(model, "_orig_mod") else model
+    _model = unwrap_compiled(model)
 
-    # Collect hidden states
+    # Collect hidden states (kept on GPU)
     all_hidden = []
     for input_ids, attention_mask in zip(input_ids_list, attention_mask_list):
         with torch.inference_mode(), torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
@@ -58,8 +57,8 @@ def train_sae_on_splade(
             transformed = _model.vocab_transform(hidden)
             transformed = torch.nn.functional.gelu(transformed)
             transformed = _model.vocab_layer_norm(transformed)
-        # Use CLS token representation
-        all_hidden.append(transformed[:, 0, :].cpu())
+        # Use CLS token representation, keep on GPU
+        all_hidden.append(transformed[:, 0, :].detach().float())
 
     hidden_states = torch.cat(all_hidden, dim=0)
     input_dim = hidden_states.shape[-1]
@@ -76,10 +75,7 @@ def train_sae_on_splade(
 
     sae.train()
     for epoch in range(epochs):
-        total_loss = 0.0
-        n_batches = 0
         for (batch,) in loader:
-            batch = batch.to(DEVICE)
             optimizer.zero_grad()
             reconstruction, hidden = sae(batch)
             recon_loss = nn.functional.mse_loss(reconstruction, batch)
@@ -87,8 +83,6 @@ def train_sae_on_splade(
             loss = recon_loss + l1_coeff * l1_loss
             loss.backward()
             optimizer.step()
-            total_loss += loss.item()
-            n_batches += 1
 
     sae.eval()
     return sae
@@ -97,24 +91,29 @@ def train_sae_on_splade(
 def compute_sae_attribution(
     sae: SimpleSAE,
     hidden_states: torch.Tensor,
-    classifier_weight: numpy.ndarray,
+    classifier_weight: torch.Tensor,
     class_idx: int,
-) -> numpy.ndarray:
+    vocab_projector_weight: torch.Tensor,
+) -> torch.Tensor:
     """Compute attribution through SAE features.
 
     Projects hidden states through SAE encoder to get sparse features,
-    then computes how each SAE feature contributes to the classifier output.
+    then computes how each SAE feature contributes to the classifier output
+    via the full pathway: SAE decoder -> vocab projector -> classifier.
+
+    All computation stays on GPU. Returns a 1-D attribution tensor.
     """
     with torch.inference_mode():
         sae_features = sae.encode(hidden_states.to(DEVICE))
-        decoded = sae.decoder(sae_features)
 
-    # SAE features -> decoder -> vocab space -> classifier
-    # Attribution = sae_feature * (decoder_weight @ classifier_weight)
-    decoder_weight = sae.decoder.weight.cpu().numpy()  # [input_dim, hidden_dim]
-    projection = decoder_weight.T @ classifier_weight[class_idx]  # [hidden_dim]
+    decoder_weight = sae.decoder.weight  # [hidden_size, hidden_dim]
+    sae_features_flat = sae_features.squeeze()  # [hidden_dim]
 
-    sae_features_np = sae_features.cpu().numpy().squeeze()
-    attribution = sae_features_np * projection
+    # Full pathway: SAE feature -> decoder (hidden_dim -> hidden_size)
+    #   -> vocab_projector (hidden_size -> padded_vocab_size) -> classifier_fc2 row
+    # Note: SAE operates on hidden states before the ReLU MLP, so we use
+    # classifier_fc2.weight directly (not W_eff) for this comparison.
+    proj = decoder_weight.T @ vocab_projector_weight.T @ classifier_weight[class_idx]  # [hidden_dim]
+    attribution = sae_features_flat * proj
 
     return attribution

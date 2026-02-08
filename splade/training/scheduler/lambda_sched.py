@@ -1,6 +1,7 @@
 import torch
 
 from splade.training.constants import LAMBDA_FINAL
+from splade.utils.cuda import DEVICE
 
 
 class SatLambdaSchedule:
@@ -9,12 +10,12 @@ class SatLambdaSchedule:
         self.total_steps = total_steps
         self._step = 0
         self._current_sparsity = 0.0
-        self._sparsity_sum = 0.0
+        self._sparsity_sum = torch.tensor(0.0, device=DEVICE)
         self._sparsity_count = 0
 
     def compute_lambda(self, activations: torch.Tensor) -> float:
-        with torch.inference_mode():
-            self._sparsity_sum += (activations.abs() < 1e-6).float().mean()
+        with torch.no_grad():
+            self._sparsity_sum += (activations.detach().abs() < 1e-6).float().mean()
             self._sparsity_count += 1
 
         current_step = self._step
@@ -28,9 +29,6 @@ class SatLambdaSchedule:
 
     def sync_sparsity(self) -> None:
         if self._sparsity_count > 0:
-            if isinstance(self._sparsity_sum, torch.Tensor):
-                self._current_sparsity = (self._sparsity_sum / self._sparsity_count).item()
-            else:
-                self._current_sparsity = self._sparsity_sum / self._sparsity_count
-        self._sparsity_sum = 0.0
+            self._current_sparsity = (self._sparsity_sum / self._sparsity_count).item()
+        self._sparsity_sum.zero_()
         self._sparsity_count = 0

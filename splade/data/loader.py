@@ -4,6 +4,14 @@ import numpy
 from datasets import load_dataset
 
 
+_DATASETS = {
+    "sst2": {"path": "glue", "name": "sst2", "text_col": "sentence", "test_split": "validation", "num_labels": 2},
+    "ag_news": {"path": "ag_news", "name": None, "text_col": "text", "test_split": "test", "num_labels": 4},
+    "imdb": {"path": "imdb", "name": None, "text_col": "text", "test_split": "test", "num_labels": 2},
+    "yelp": {"path": "yelp_polarity", "name": None, "text_col": "text", "test_split": "test", "num_labels": 2},
+}
+
+
 def _shuffle_and_truncate(
     texts: list[str], labels: list[int], max_samples: int, seed: int
 ) -> tuple[list[str], list[int]]:
@@ -21,72 +29,11 @@ def infer_max_length(texts: list[str], tokenizer) -> int:
     return max(64, min(512, aligned))
 
 
-def _load_sst2_split(split: str, max_samples: int, seed: int) -> tuple[list[str], list[int]]:
-    dataset = load_dataset("glue", "sst2", split=split)
-    texts = list(dataset["sentence"])
+def _load_split(cfg: dict, split: str, max_samples: int, seed: int) -> tuple[list[str], list[int]]:
+    dataset = load_dataset(cfg["path"], cfg["name"], split=split)
+    texts = list(dataset[cfg["text_col"]])
     labels = [int(label) for label in dataset["label"]]
     return _shuffle_and_truncate(texts, labels, max_samples, seed)
-
-
-def load_sst2_data(
-    train_samples: int,
-    test_samples: int,
-    seed: int = 42,
-) -> tuple[list[str], list[int], list[str], list[int], int]:
-    train_texts, train_labels = _load_sst2_split("train", train_samples, seed)
-    test_texts, test_labels = _load_sst2_split("validation", test_samples, seed)
-    return train_texts, train_labels, test_texts, test_labels, 2
-
-
-def _load_ag_news_split(split: str, max_samples: int, seed: int) -> tuple[list[str], list[int]]:
-    dataset = load_dataset("ag_news", split=split)
-    texts = list(dataset["text"])
-    labels = [int(label) for label in dataset["label"]]
-    return _shuffle_and_truncate(texts, labels, max_samples, seed)
-
-
-def load_ag_news_data(
-    train_samples: int,
-    test_samples: int,
-    seed: int = 42,
-) -> tuple[list[str], list[int], list[str], list[int], int]:
-    train_texts, train_labels = _load_ag_news_split("train", train_samples, seed)
-    test_texts, test_labels = _load_ag_news_split("test", test_samples, seed)
-    return train_texts, train_labels, test_texts, test_labels, 4
-
-
-def _load_imdb_split(split: str, max_samples: int, seed: int) -> tuple[list[str], list[int]]:
-    dataset = load_dataset("imdb", split=split)
-    texts = list(dataset["text"])
-    labels = [int(label) for label in dataset["label"]]
-    return _shuffle_and_truncate(texts, labels, max_samples, seed)
-
-
-def load_imdb_data(
-    train_samples: int,
-    test_samples: int,
-    seed: int = 42,
-) -> tuple[list[str], list[int], list[str], list[int], int]:
-    train_texts, train_labels = _load_imdb_split("train", train_samples, seed)
-    test_texts, test_labels = _load_imdb_split("test", test_samples, seed)
-    return train_texts, train_labels, test_texts, test_labels, 2
-
-
-def _load_yelp_split(split: str, max_samples: int, seed: int) -> tuple[list[str], list[int]]:
-    dataset = load_dataset("yelp_polarity", split=split)
-    texts = list(dataset["text"])
-    labels = [int(label) for label in dataset["label"]]
-    return _shuffle_and_truncate(texts, labels, max_samples, seed)
-
-
-def load_yelp_data(
-    train_samples: int,
-    test_samples: int,
-    seed: int = 42,
-) -> tuple[list[str], list[int], list[str], list[int], int]:
-    train_texts, train_labels = _load_yelp_split("train", train_samples, seed)
-    test_texts, test_labels = _load_yelp_split("test", test_samples, seed)
-    return train_texts, train_labels, test_texts, test_labels, 2
 
 
 def load_dataset_by_name(
@@ -95,10 +42,7 @@ def load_dataset_by_name(
     test_samples: int,
     seed: int = 42,
 ) -> tuple[list[str], list[int], list[str], list[int], int]:
-    loaders = {
-        "sst2": load_sst2_data,
-        "ag_news": load_ag_news_data,
-        "imdb": load_imdb_data,
-        "yelp": load_yelp_data,
-    }
-    return loaders[name](train_samples, test_samples, seed)
+    cfg = _DATASETS[name]
+    train_texts, train_labels = _load_split(cfg, "train", train_samples, seed)
+    test_texts, test_labels = _load_split(cfg, cfg["test_split"], test_samples, seed)
+    return train_texts, train_labels, test_texts, test_labels, cfg["num_labels"]

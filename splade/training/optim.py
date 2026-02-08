@@ -10,16 +10,15 @@ from splade.training.constants import (AGC_CLIP_FACTOR, AGC_EPS,
                                        LR_FIND_DIVERGE_FACTOR, LR_FIND_END,
                                        LR_FIND_STEPS, WARMUP_RATIO,
                                        WEIGHT_DECAY)
-from splade.utils.cuda import COMPUTE_DTYPE
+from splade.utils.cuda import COMPUTE_DTYPE, DEVICE, unwrap_compiled
 
 
 def find_lr(
     model: torch.nn.Module,
     train_loader: torch.utils.data.DataLoader,
     num_labels: int,
-    device: torch.device,
 ) -> float:
-    _orig = model._orig_mod
+    _orig = unwrap_compiled(model)
     saved_state = copy.deepcopy(_orig.state_dict())
 
     temp_optimizer = torch.optim.AdamW(_orig.parameters(), lr=LR_FIND_END, fused=True)
@@ -42,7 +41,7 @@ def find_lr(
     for _ in range(LR_FIND_STEPS):
         batch = next(data_iter)
 
-        batch_ids, batch_mask, batch_labels = (b.to(device, non_blocking=True) for b in batch)
+        batch_ids, batch_mask, batch_labels = (b.to(DEVICE, non_blocking=True) for b in batch)
 
         for g in temp_optimizer.param_groups:
             g["lr"] = current_lr
@@ -93,7 +92,7 @@ def _infer_batch_size(model_name: str, max_length: int) -> int:
 
 
 def _build_param_groups(model: torch.nn.Module, base_lr: float) -> list[dict]:
-    _orig = model._orig_mod
+    _orig = unwrap_compiled(model)
     decay_params: list[torch.nn.Parameter] = []
     no_decay_params: list[torch.nn.Parameter] = []
     for name, param in _orig.named_parameters():
@@ -156,5 +155,3 @@ class _LRScheduler:
         return self.base_lr * 0.5 * (1 + math.cos(math.pi * progress))
 
 
-def _compute_warmup_steps(total_steps: int) -> int:
-    return max(1, int(WARMUP_RATIO * total_steps))

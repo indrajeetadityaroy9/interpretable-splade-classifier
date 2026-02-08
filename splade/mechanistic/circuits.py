@@ -1,12 +1,11 @@
 from dataclasses import dataclass, field
 
-import numpy
 import torch
 
 from splade.mechanistic.attribution import (VocabularyAttribution,
                                             compute_direct_logit_attribution)
 from splade.mechanistic.patching import patch_sparse_vector
-from splade.utils.cuda import COMPUTE_DTYPE
+from splade.utils.cuda import COMPUTE_DTYPE, DEVICE, unwrap_compiled
 
 
 @dataclass
@@ -32,23 +31,22 @@ def extract_vocabulary_circuit(
     Tokens are included in the circuit if their mean absolute attribution exceeds
     the threshold fraction of total attribution mass.
     """
-    _model = model._orig_mod if hasattr(model, "_orig_mod") else model
+    _model = unwrap_compiled(model)
     vocab_size = _model.padded_vocab_size
 
-    with torch.inference_mode():
-        classifier_weight = _model.classifier.weight.cpu().numpy()
-
-    token_attribution_sums = numpy.zeros(vocab_size)
-    token_counts = numpy.zeros(vocab_size)
+    token_attribution_sums = torch.zeros(vocab_size, device=DEVICE)
+    token_counts = torch.zeros(vocab_size, device=DEVICE)
     n_examples = 0
 
     for input_ids, attention_mask in zip(input_ids_list, attention_mask_list):
         with torch.inference_mode(), torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
             _, sparse_vector = _model(input_ids, attention_mask)
 
-        sparse_np = sparse_vector[0].cpu().numpy()
+        sparse_v = sparse_vector[0]
+        with torch.inference_mode():
+            W_eff, _ = _model.compute_effective_weights(sparse_vector)
         attrib = compute_direct_logit_attribution(
-            sparse_np, classifier_weight, tokenizer, class_idx
+            sparse_v, W_eff[0], tokenizer, class_idx
         )
 
         for tid, score in zip(attrib.token_ids, attrib.attribution_scores):
@@ -59,10 +57,10 @@ def extract_vocabulary_circuit(
     if n_examples == 0:
         return VocabularyCircuit(class_idx=class_idx)
 
-    mean_attributions = numpy.where(
+    mean_attributions = torch.where(
         token_counts > 0,
         token_attribution_sums / n_examples,
-        0.0,
+        torch.zeros(1, device=DEVICE),
     )
 
     total_mass = mean_attributions.sum()
@@ -71,20 +69,20 @@ def extract_vocabulary_circuit(
 
     normalized = mean_attributions / total_mass
     circuit_mask = normalized >= threshold
-    circuit_token_ids = numpy.where(circuit_mask)[0]
+    circuit_token_ids = torch.where(circuit_mask)[0]
 
-    sorted_indices = numpy.argsort(mean_attributions[circuit_token_ids])[::-1]
+    sorted_indices = torch.argsort(mean_attributions[circuit_token_ids], descending=True)
     circuit_token_ids = circuit_token_ids[sorted_indices].tolist()
 
     token_names = tokenizer.convert_ids_to_tokens(circuit_token_ids)
-    scores = [float(mean_attributions[tid]) for tid in circuit_token_ids]
+    scores = [float(mean_attributions[tid].item()) for tid in circuit_token_ids]
 
     return VocabularyCircuit(
         class_idx=class_idx,
         token_ids=circuit_token_ids,
         token_names=token_names,
         attribution_scores=scores,
-        total_attribution=float(total_mass),
+        total_attribution=float(total_mass.item()),
     )
 
 
@@ -99,7 +97,7 @@ def measure_circuit_completeness(
 
     Returns the fraction of examples correctly classified using only circuit tokens.
     """
-    _model = model._orig_mod if hasattr(model, "_orig_mod") else model
+    _model = unwrap_compiled(model)
     vocab_size = _model.padded_vocab_size
     circuit_set = set(circuit.token_ids)
     non_circuit_ids = [i for i in range(vocab_size) if i not in circuit_set]

@@ -1,5 +1,5 @@
-experiment_name: "mechanistic_sst2"
-output_dir: "results/mechanistic/base"
+experiment_name: "ablation_cis"
+output_dir: "results/ablation/cis"
 
 data:
   dataset_name: "sst2"
@@ -11,6 +11,3 @@ model:
 
 evaluation:
   seeds: [42]
-
-mechanistic:
-  circuit_threshold: 0.01

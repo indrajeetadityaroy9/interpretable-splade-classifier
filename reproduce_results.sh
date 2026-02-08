@@ -1,27 +1,43 @@
 #!/bin/bash
 set -e
 
-echo "Starting Reproduction Pipeline..."
+echo "============================================"
+echo "Circuit-Integrated SPLADE (CIS) — Reproduction Pipeline"
+echo "============================================"
 
 # 1. Main Benchmarks
-echo "Reproducing Main Results..."
+echo "Running CIS Main Benchmarks..."
 for config in experiments/main/*.yaml; do
     echo "Running $config"
-    python -m splade.scripts.eval --config "$config"
+    python -m splade.scripts.run_experiment --config "$config"
 done
 
-# 2. Ablations
-echo "Reproducing Ablations..."
-for config in experiments/ablations/*.yaml; do
+# 2. Dataset Experiments
+echo "Running CIS Dataset Experiments..."
+for config in experiments/datasets/*.yaml; do
     echo "Running $config"
-    python -m splade.scripts.eval --config "$config"
+    python -m splade.scripts.run_experiment --config "$config"
 done
 
-# 3. Sensitivity
-echo "Reproducing Sensitivity Analysis..."
-for config in experiments/sensitivity/*.yaml; do
+# 3. Scaling Experiments
+echo "Running CIS Scaling Experiments..."
+for config in experiments/scaling/*.yaml; do
     echo "Running $config"
-    python -m splade.scripts.eval --config "$config"
+    python -m splade.scripts.run_experiment --config "$config"
+done
+
+# 4. Ablations
+echo "Running CIS Ablations..."
+for config in experiments/ablation/*.yaml; do
+    echo "Running $config"
+    python -m splade.scripts.run_ablation --config "$config"
+done
+
+# 5. Mechanistic Evaluation
+echo "Running Mechanistic Evaluation..."
+for config in experiments/mechanistic/*.yaml; do
+    echo "Running $config"
+    python -m splade.scripts.run_experiment --config "$config"
 done
 
 echo "Reproduction Complete. Results are in results/"

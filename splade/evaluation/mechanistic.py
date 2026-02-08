@@ -10,7 +10,7 @@ from splade.mechanistic.circuits import (VocabularyCircuit,
                                          visualize_circuit)
 from splade.mechanistic.metrics import measure_semantic_fidelity
 from splade.mechanistic.patching import ablate_vocabulary_tokens
-from splade.utils.cuda import COMPUTE_DTYPE
+from splade.utils.cuda import COMPUTE_DTYPE, DEVICE, unwrap_compiled
 
 
 @dataclass
@@ -20,6 +20,75 @@ class MechanisticResults:
     circuit_completeness: dict[int, float] = field(default_factory=dict)
     semantic_fidelity: dict = field(default_factory=dict)
     dla_verification_error: float = 0.0
+    sae_comparison: dict = field(default_factory=dict)
+
+
+def _run_sae_comparison(
+    model: torch.nn.Module,
+    input_ids_list: list[torch.Tensor],
+    attention_mask_list: list[torch.Tensor],
+    labels: list[int],
+    tokenizer,
+) -> dict:
+    """Train SAE and compare with DLA in terms of active feature counts."""
+    from splade.mechanistic.sae import compute_sae_attribution, train_sae_on_splade
+
+    _model = unwrap_compiled(model)
+
+    print("Training SAE on hidden states...")
+    sae = train_sae_on_splade(model, input_ids_list, attention_mask_list)
+
+    with torch.inference_mode():
+        classifier_weight = _model.classifier_fc2.weight
+        vocab_projector_weight = _model.vocab_projector.weight
+
+    dla_active_counts = []
+    sae_active_counts = []
+
+    for input_ids, attention_mask, label in zip(input_ids_list, attention_mask_list, labels):
+        with torch.inference_mode(), torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
+            _, sparse_vector = _model(input_ids, attention_mask)
+            bert_output = _model.bert(input_ids=input_ids, attention_mask=attention_mask)
+            hidden = bert_output.last_hidden_state
+            transformed = _model.vocab_transform(hidden)
+            transformed = torch.nn.functional.gelu(transformed)
+            transformed = _model.vocab_layer_norm(transformed)
+            cls_hidden = transformed[:, 0, :]
+
+        # DLA active count
+        dla_active = int((sparse_vector[0] > 0).sum().item())
+        dla_active_counts.append(dla_active)
+
+        # SAE active count
+        sae_attrib = compute_sae_attribution(
+            sae, cls_hidden, classifier_weight, label, vocab_projector_weight,
+        )
+        sae_active = int((sae_attrib.abs() > 1e-6).sum().item())
+        sae_active_counts.append(sae_active)
+
+    # SAE reconstruction error
+    all_hidden = []
+    for input_ids, attention_mask in zip(input_ids_list, attention_mask_list):
+        with torch.inference_mode(), torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
+            bert_output = _model.bert(input_ids=input_ids, attention_mask=attention_mask)
+            hidden = bert_output.last_hidden_state
+            transformed = _model.vocab_transform(hidden)
+            transformed = torch.nn.functional.gelu(transformed)
+            transformed = _model.vocab_layer_norm(transformed)
+        all_hidden.append(transformed[:, 0, :].detach().float())
+
+    hidden_tensor = torch.cat(all_hidden, dim=0)
+    with torch.inference_mode():
+        reconstruction, _ = sae(hidden_tensor)
+        recon_error = float(torch.nn.functional.mse_loss(
+            reconstruction, hidden_tensor,
+        ).item())
+
+    return {
+        "dla_active_tokens": sum(dla_active_counts) / len(dla_active_counts),
+        "sae_active_features": sum(sae_active_counts) / len(sae_active_counts),
+        "reconstruction_error": recon_error,
+    }
 
 
 def run_mechanistic_evaluation(
@@ -30,16 +99,13 @@ def run_mechanistic_evaluation(
     tokenizer,
     num_classes: int,
     circuit_threshold: float = 0.01,
+    run_sae_comparison: bool = False,
 ) -> MechanisticResults:
     """Run the full mechanistic interpretability evaluation suite."""
-    _model = model._orig_mod if hasattr(model, "_orig_mod") else model
+    _model = unwrap_compiled(model)
     results = MechanisticResults()
 
-    # 1. Verify DLA invariant: sum(attribution) == logit
-    with torch.inference_mode():
-        classifier_weight = _model.classifier.weight.cpu().numpy()
-        classifier_bias = _model.classifier.bias.cpu().numpy() if _model.classifier.bias is not None else None
-
+    # 1. Verify DLA invariant: sum(s_j * W_eff[c,j]) + b_eff_c == logit_c
     total_error = 0.0
     correct = 0
     n = 0
@@ -51,12 +117,12 @@ def run_mechanistic_evaluation(
         if pred == label:
             correct += 1
 
-        sparse_np = sparse_vector[0].cpu().numpy()
+        sparse_v = sparse_vector[0]
         actual_logit = float(logits[0, label].item())
-        attrib = compute_direct_logit_attribution(sparse_np, classifier_weight, tokenizer, label)
-        reconstructed = attrib.logit
-        if classifier_bias is not None:
-            reconstructed += classifier_bias[label]
+        with torch.inference_mode():
+            W_eff, b_eff = _model.compute_effective_weights(sparse_vector)
+        attrib = compute_direct_logit_attribution(sparse_v, W_eff[0], tokenizer, label)
+        reconstructed = attrib.logit + float(b_eff[0, label].item())
         total_error += abs(actual_logit - reconstructed)
         n += 1
 
@@ -94,6 +160,12 @@ def run_mechanistic_evaluation(
         model, input_ids_list, attention_mask_list, labels, tokenizer,
     )
 
+    # 5. SAE baseline comparison (optional)
+    if run_sae_comparison:
+        results.sae_comparison = _run_sae_comparison(
+            model, input_ids_list, attention_mask_list, labels, tokenizer,
+        )
+
     return results
 
 
@@ -123,5 +195,12 @@ def print_mechanistic_results(results: MechanisticResults) -> None:
         if "class_top_tokens" in sf:
             for c, tokens in sf["class_top_tokens"].items():
                 print(f"  Class {c} top tokens: {', '.join(tokens[:10])}")
+
+    if results.sae_comparison:
+        sae = results.sae_comparison
+        print(f"\n--- SAE BASELINE COMPARISON ---")
+        print(f"  DLA active tokens (mean): {sae.get('dla_active_tokens', 0):.1f}")
+        print(f"  SAE active features (mean): {sae.get('sae_active_features', 0):.1f}")
+        print(f"  SAE reconstruction error: {sae.get('reconstruction_error', 0):.4f}")
 
     print("\n" + "=" * 80)

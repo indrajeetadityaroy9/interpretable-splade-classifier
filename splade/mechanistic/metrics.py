@@ -1,53 +1,7 @@
-import numpy
 import torch
 
 from splade.mechanistic.attribution import compute_direct_logit_attribution
-from splade.utils.cuda import COMPUTE_DTYPE
-
-
-def measure_superposition_accuracy_tradeoff(
-    models: list[torch.nn.Module],
-    tokenizers: list,
-    input_ids_list: list[torch.Tensor],
-    attention_mask_list: list[torch.Tensor],
-    labels: list[int],
-    lambda_values: list[float],
-) -> list[dict]:
-    """Measure sparsity vs accuracy across models trained with different regularization.
-
-    Returns a list of dicts with {lambda, accuracy, mean_sparsity, mean_nonzero_dims}.
-    """
-    results = []
-
-    for model, tokenizer, lam in zip(models, tokenizers, lambda_values):
-        _model = model._orig_mod if hasattr(model, "_orig_mod") else model
-        correct = 0
-        total_sparsity = 0.0
-        total_nonzero = 0.0
-        n = 0
-
-        for input_ids, attention_mask, label in zip(input_ids_list, attention_mask_list, labels):
-            with torch.inference_mode(), torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
-                logits, sparse_vector = _model(input_ids, attention_mask)
-
-            pred = int(logits.argmax(dim=-1).item())
-            if pred == label:
-                correct += 1
-
-            sv = sparse_vector[0].cpu()
-            nonzero = (sv > 0).sum().item()
-            total_nonzero += nonzero
-            total_sparsity += 1.0 - (nonzero / sv.shape[0])
-            n += 1
-
-        results.append({
-            "lambda": lam,
-            "accuracy": correct / n if n > 0 else 0.0,
-            "mean_sparsity": total_sparsity / n if n > 0 else 0.0,
-            "mean_nonzero_dims": total_nonzero / n if n > 0 else 0.0,
-        })
-
-    return results
+from splade.utils.cuda import COMPUTE_DTYPE, unwrap_compiled
 
 
 def measure_semantic_fidelity(
@@ -62,23 +16,28 @@ def measure_semantic_fidelity(
 
     Computes per-class token frequency overlap and consistency metrics.
     """
-    _model = model._orig_mod if hasattr(model, "_orig_mod") else model
+    _model = unwrap_compiled(model)
 
-    with torch.inference_mode():
-        classifier_weight = _model.classifier.weight.cpu().numpy()
-
-    num_classes = classifier_weight.shape[0]
+    num_classes = _model.classifier_fc2.weight.shape[0]
     class_token_counts: dict[int, dict[int, int]] = {c: {} for c in range(num_classes)}
+    sample_top_tokens: list[set[int]] = []
+    sample_labels: list[int] = []
 
     for input_ids, attention_mask, label in zip(input_ids_list, attention_mask_list, labels):
         with torch.inference_mode(), torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
             _, sparse_vector = _model(input_ids, attention_mask)
 
-        sparse_np = sparse_vector[0].cpu().numpy()
-        attrib = compute_direct_logit_attribution(sparse_np, classifier_weight, tokenizer, label)
+        sparse_v = sparse_vector[0]
+        with torch.inference_mode():
+            W_eff, _ = _model.compute_effective_weights(sparse_vector)
+        attrib = compute_direct_logit_attribution(sparse_v, W_eff[0], tokenizer, label)
+
+        sample_top_set = set(attrib.token_ids[:top_k])
+        sample_top_tokens.append(sample_top_set)
+        sample_labels.append(label)
 
         for tid in attrib.token_ids[:top_k]:
-            class_token_counts[label][int(tid)] = class_token_counts[label].get(int(tid), 0) + 1
+            class_token_counts[label][tid] = class_token_counts[label].get(tid, 0) + 1
 
     class_top_tokens = {}
     for c in range(num_classes):
@@ -86,27 +45,39 @@ def measure_semantic_fidelity(
         sorted_tokens = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:top_k]
         class_top_tokens[c] = set(tid for tid, _ in sorted_tokens)
 
-    overlap_matrix = numpy.zeros((num_classes, num_classes))
-    for i in range(num_classes):
-        for j in range(num_classes):
-            if class_top_tokens[i] and class_top_tokens[j]:
-                intersection = len(class_top_tokens[i] & class_top_tokens[j])
-                union = len(class_top_tokens[i] | class_top_tokens[j])
-                overlap_matrix[i, j] = intersection / union if union > 0 else 0.0
+    # Within-class consistency: average pairwise Jaccard across samples of the same class
+    within_class_overlaps = []
+    for c in range(num_classes):
+        class_indices = [i for i, lbl in enumerate(sample_labels) if lbl == c]
+        for i_idx in range(len(class_indices)):
+            for j_idx in range(i_idx + 1, len(class_indices)):
+                set_i = sample_top_tokens[class_indices[i_idx]]
+                set_j = sample_top_tokens[class_indices[j_idx]]
+                if set_i and set_j:
+                    intersection = len(set_i & set_j)
+                    union = len(set_i | set_j)
+                    within_class_overlaps.append(intersection / union if union > 0 else 0.0)
+    within_class = sum(within_class_overlaps) / len(within_class_overlaps) if within_class_overlaps else 0.0
 
-    within_class = float(numpy.mean([overlap_matrix[i, i] for i in range(num_classes)]))
-
+    # Cross-class overlap: Jaccard between per-class aggregate top-token sets
     cross_class_vals = []
     for i in range(num_classes):
         for j in range(i + 1, num_classes):
-            cross_class_vals.append(overlap_matrix[i, j])
-    cross_class = float(numpy.mean(cross_class_vals)) if cross_class_vals else 0.0
+            set_i = class_top_tokens.get(i, set())
+            set_j = class_top_tokens.get(j, set())
+            if set_i and set_j:
+                intersection = len(set_i & set_j)
+                union = len(set_i | set_j)
+                cross_class_vals.append(intersection / union if union > 0 else 0.0)
+            else:
+                cross_class_vals.append(0.0)
+    cross_class = sum(cross_class_vals) / len(cross_class_vals) if cross_class_vals else 0.0
 
     separation = within_class - cross_class
 
     class_top_names = {}
     for c in range(num_classes):
-        token_ids = list(class_top_tokens[c])
+        token_ids = list(class_top_tokens.get(c, set()))
         class_top_names[c] = tokenizer.convert_ids_to_tokens(token_ids) if token_ids else []
 
     return {

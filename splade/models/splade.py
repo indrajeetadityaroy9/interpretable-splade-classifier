@@ -3,6 +3,7 @@ import torch.nn
 from transformers import AutoConfig, AutoModel, AutoModelForMaskedLM
 
 from splade.models.layers.activation import DReLU
+from splade.training.constants import CLASSIFIER_HIDDEN
 
 
 def _get_nested_attr(obj, path: str):
@@ -57,7 +58,48 @@ class SpladeModel(torch.nn.Module):
             self.vocab_projector.bias[:self.vocab_size].copy_(pretrained_proj.bias)
         del masked_lm
 
-        self.classifier = torch.nn.Linear(self.padded_vocab_size, num_labels)
+        self.classifier_fc1 = torch.nn.Linear(self.padded_vocab_size, CLASSIFIER_HIDDEN)
+        self.classifier_fc2 = torch.nn.Linear(CLASSIFIER_HIDDEN, num_labels)
+
+    def classifier_forward(self, sparse_vector: torch.Tensor) -> torch.Tensor:
+        """ReLU MLP classifier: fc1 -> ReLU -> fc2."""
+        hidden = self.classifier_fc1(sparse_vector)
+        hidden = torch.relu(hidden)
+        return self.classifier_fc2(hidden)
+
+    def compute_effective_weights(
+        self, sparse_vector: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute W_eff(s) = W2 @ diag(D(s)) @ W1 for exact DLA.
+
+        For a ReLU MLP, the activation mask D(s) makes the network
+        piecewise linear. W_eff gives exact per-dimension attribution:
+            logit_c = sum_j s_j * W_eff[c,j] + b_eff_c
+
+        Args:
+            sparse_vector: [batch, V] sparse activations.
+
+        Returns:
+            W_eff: [batch, C, V] effective weight matrix.
+            b_eff: [batch, C] effective bias vector.
+        """
+        with torch.no_grad():
+            pre_relu = self.classifier_fc1(sparse_vector)
+            activation_mask = (pre_relu > 0).float()
+
+        W1 = self.classifier_fc1.weight  # [H, V]
+        W2 = self.classifier_fc2.weight  # [C, H]
+        b1 = self.classifier_fc1.bias    # [H]
+        b2 = self.classifier_fc2.bias    # [C]
+
+        # masked_W1[batch, H, V] = mask[:,:,None] * W1[None,:,:]
+        masked_W1 = activation_mask.unsqueeze(-1) * W1.unsqueeze(0)
+        # W_eff[batch, C, V] = W2 @ masked_W1
+        W_eff = torch.matmul(W2.unsqueeze(0), masked_W1)
+        # b_eff[batch, C] = W2 @ (mask * b1) + b2
+        b_eff = torch.matmul(activation_mask * b1, W2.T) + b2
+
+        return W_eff, b_eff
 
     def _splade_head(
         self,
@@ -77,7 +119,10 @@ class SpladeModel(torch.nn.Module):
             ~attention_mask.unsqueeze(-1).bool(), 0.0
         )
         sparse_vector = masked_activations.max(dim=1).values
-        logits = self.classifier(sparse_vector)
+        assert sparse_vector.shape[-1] == self.padded_vocab_size, (
+            f"Sparse vector dim {sparse_vector.shape[-1]} != padded_vocab_size {self.padded_vocab_size}"
+        )
+        logits = self.classifier_forward(sparse_vector)
 
         if return_intermediates:
             intermediates = {
