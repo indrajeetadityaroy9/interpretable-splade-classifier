@@ -38,7 +38,7 @@ PER: **0.93** F1 | LOC: **0.88** F1 | ORG: **0.77** F1 | MISC: **0.72** F1
 |:---|:---|:---|
 | **Training** | Trained *after* model (Frozen) | Trained *during* model (Intrinsic) |
 | **Reconstruction** | Lossy ($x \approx \hat{x}$) | **Exact** ($y \equiv \sum s_i w_i$) |
-| **Dictionary** | Learned Latents (Feature #1405) | **Vocabulary** ("Muslim", "Profit") |
+| **Dictionary** | Learned Latents (Feature #1405) | **Vocabulary**|
 | **Granularity** | Layer-wise or Residual Stream | **Token-wise** (Sequence Modeling) |
 | **Intervention** | Approximate Steering | **Exact Removal** (Guaranteed $s_i=0$) |
 
