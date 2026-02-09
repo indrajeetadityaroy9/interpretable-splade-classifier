@@ -13,7 +13,7 @@ def _get_nested_attr(obj, path: str):
     return obj
 
 
-class SpladeModel(torch.nn.Module):
+class CISModel(torch.nn.Module):
 
     def __init__(self, model_name: str, num_labels: int):
         super().__init__()
@@ -41,6 +41,12 @@ class SpladeModel(torch.nn.Module):
                 "vocab_layer_norm",
                 "vocab_projector",
             )
+        elif "modernbert" in model_name.lower():
+            transform_path, norm_path, proj_path = (
+                "head.dense",
+                "head.norm",
+                "decoder",
+            )
         else:
             transform_path, norm_path, proj_path = (
                 "cls.predictions.transform.dense",
@@ -56,7 +62,8 @@ class SpladeModel(torch.nn.Module):
         pretrained_proj = _get_nested_attr(masked_lm, proj_path)
         with torch.no_grad():
             self.vocab_projector.weight[:self.vocab_size].copy_(pretrained_proj.weight)
-            self.vocab_projector.bias[:self.vocab_size].copy_(pretrained_proj.bias)
+            if hasattr(pretrained_proj, "bias") and pretrained_proj.bias is not None:
+                self.vocab_projector.bias[:self.vocab_size].copy_(pretrained_proj.bias)
         del masked_lm
 
         self.classifier_fc1 = torch.nn.Linear(self.padded_vocab_size, CLASSIFIER_HIDDEN)

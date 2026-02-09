@@ -1,7 +1,8 @@
 import yaml
 
 from splade.config.schema import (Config, DataConfig, EvaluationConfig,
-                                  MechanisticConfig, ModelConfig)
+                                  MechanisticConfig, ModelConfig,
+                                  TrainingConfig)
 
 
 def load_config(path: str) -> Config:
@@ -19,6 +20,8 @@ def load_config(path: str) -> Config:
     # Drop legacy keys that no longer exist in MechanisticConfig
     mech_raw.pop("enabled", None)
 
+    training_raw = raw_config.get("training", {})
+
     return Config(
         experiment_name=raw_config["experiment_name"],
         output_dir=raw_config["output_dir"],
@@ -26,4 +29,5 @@ def load_config(path: str) -> Config:
         model=ModelConfig(**raw_config["model"]),
         evaluation=EvaluationConfig(**eval_kwargs),
         mechanistic=MechanisticConfig(**mech_raw),
+        training=TrainingConfig(**training_raw),
     )

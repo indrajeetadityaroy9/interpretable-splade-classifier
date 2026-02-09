@@ -36,18 +36,16 @@ def test_scripts_argparse_clean(file_path):
              pytest.fail(f"Found extra CLI argument {arg_name} in {file_path}. Only --config is allowed.")
 
 
-def test_cis_hardwired():
-    """Verify CIS mechanisms are hardwired — no TrainingConfig, no config.training."""
-    import splade.config.schema as schema
-    assert not hasattr(schema, "TrainingConfig"), "TrainingConfig should not exist"
-
-    from splade.config.schema import Config
-    config_fields = {f.name for f in Config.__dataclass_fields__.values()}
-    assert "training" not in config_fields, "Config should not have a 'training' field"
+def test_cis_config_knobs():
+    """Verify CIS exposes exactly 3 training knobs via TrainingConfig."""
+    from splade.config.schema import TrainingConfig
+    knob_names = set(TrainingConfig.__dataclass_fields__.keys())
+    assert knob_names == {"target_accuracy", "sparsity_target", "warmup_fraction"}, \
+        f"TrainingConfig should have exactly 3 knobs, got: {knob_names}"
 
     from splade.training.loop import train_model
     sig = inspect.signature(train_model)
     params = list(sig.parameters.keys())
     assert "use_df_weighting" not in params, "train_model should not have use_df_weighting param"
     assert "circuit_aware" not in params, "train_model should not have circuit_aware param"
-    assert len(params) == 10, f"train_model should have 10 params, got {len(params)}: {params}"
+    assert len(params) == 13, f"train_model should have 13 params, got {len(params)}: {params}"

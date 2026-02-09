@@ -1,0 +1,16 @@
+experiment_name: "long_context"
+output_dir: "results/long_context"
+
+data:
+  dataset_name: "imdb"
+  train_samples: 5000
+  test_samples: 1000
+
+model:
+  name: "distilbert-base-uncased"
+
+evaluation:
+  seeds: [42]
+
+mechanistic:
+  circuit_fraction: 0.1

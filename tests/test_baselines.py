@@ -12,8 +12,8 @@ from splade.evaluation.baselines import (
 from splade.evaluation.compare_explainers import _EXPLAINERS
 
 
-class FakeSpladeModel(torch.nn.Module):
-    """Minimal model mimicking SpladeModel's interface for testing."""
+class FakeCISModel(torch.nn.Module):
+    """Minimal model mimicking CISModel's interface for testing."""
 
     def __init__(self, vocab_size=100, num_labels=2, hidden=32):
         super().__init__()
@@ -52,7 +52,7 @@ class FakeSpladeModel(torch.nn.Module):
 @pytest.fixture
 def fake_model():
     torch.manual_seed(42)
-    return FakeSpladeModel()
+    return FakeCISModel()
 
 
 @pytest.fixture
@@ -152,8 +152,8 @@ class _FakeBERTWithAttention(torch.nn.Module):
         return _Out()
 
 
-class FakeSpladeModelWithAttention(torch.nn.Module):
-    """FakeSpladeModel with BERT-like structure for testing attention_attribution."""
+class FakeCISModelWithAttention(torch.nn.Module):
+    """FakeCISModel with BERT-like structure for testing attention_attribution."""
 
     def __init__(self, vocab_size=100, num_labels=2, hidden=32):
         super().__init__()
@@ -175,7 +175,7 @@ class FakeSpladeModelWithAttention(torch.nn.Module):
 class TestAttentionAttribution:
     def test_output_shape(self):
         torch.manual_seed(42)
-        model = FakeSpladeModelWithAttention()
+        model = FakeCISModelWithAttention()
         input_ids = torch.randint(0, 100, (4, 16))
         attention_mask = torch.ones(4, 16, dtype=torch.long)
         targets = torch.zeros(4, dtype=torch.long)
@@ -184,7 +184,7 @@ class TestAttentionAttribution:
 
     def test_nonzero(self):
         torch.manual_seed(42)
-        model = FakeSpladeModelWithAttention()
+        model = FakeCISModelWithAttention()
         input_ids = torch.randint(0, 100, (4, 16))
         attention_mask = torch.ones(4, 16, dtype=torch.long)
         targets = torch.zeros(4, dtype=torch.long)

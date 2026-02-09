@@ -58,7 +58,7 @@ def compute_comprehensiveness(
     Higher comprehensiveness = more faithful (removing important features hurts).
 
     Args:
-        model: SpladeModel (or compiled wrapper).
+        model: CISModel (or compiled wrapper).
         sparse_vectors: [N, V] pre-computed sparse activations.
         attributions: [N, V] pre-computed DLA attributions.
         labels: [N] ground-truth class indices.
@@ -105,7 +105,7 @@ def compute_sufficiency(
     Lower sufficiency = more faithful (keeping important features is enough).
 
     Args:
-        model: SpladeModel (or compiled wrapper).
+        model: CISModel (or compiled wrapper).
         sparse_vectors: [N, V] pre-computed sparse activations.
         attributions: [N, V] pre-computed DLA attributions.
         labels: [N] ground-truth class indices.

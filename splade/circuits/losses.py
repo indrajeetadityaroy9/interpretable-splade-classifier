@@ -4,10 +4,6 @@ All losses consume W_eff from the forward pass via the shared DLA function
 (mechanistic/attribution.py:compute_attribution_tensor) and use the unified
 circuit_mask() from circuits/core.py.
 
-Loss weighting uses uncertainty weighting (Kendall et al., 2018): each loss
-gets a learnable log-variance parameter. Tasks with high uncertainty are
-automatically down-weighted, eliminating manual CC/SEP/SHARP weight constants.
-
 Centroid EMA uses a 20-step window (decay ≈ 0.905), derived from semantics
 rather than arbitrary tuning.
 """
@@ -20,40 +16,12 @@ import torch.nn.functional as F
 
 from splade.circuits.core import circuit_mask
 from splade.mechanistic.attribution import compute_attribution_tensor
-from splade.training.constants import CIRCUIT_FRACTION, CIRCUIT_TEMPERATURE
+from splade.training.constants import CIRCUIT_TEMPERATURE
 from splade.utils.cuda import DEVICE
 
 # Centroid EMA: 20-step effective window → decay = 1 - 2/(20+1) ≈ 0.905
 _CENTROID_EMA_WINDOW = 20
 _CENTROID_EMA_DECAY = 1.0 - 2.0 / (_CENTROID_EMA_WINDOW + 1)
-
-
-class UncertaintyWeighting(torch.nn.Module):
-    """Learnable multi-task loss weighting via homoscedastic uncertainty.
-
-    Each task i gets a learnable log-variance log(σ²_i). The weighted loss is:
-        L_total = Σ_i [L_i / (2σ²_i) + ½ log(σ²_i)]
-
-    The log(σ²) regularizer prevents all weights from diverging to infinity.
-    Tasks with noisy/unstable gradients automatically get down-weighted.
-
-    Reference: Kendall, Gal & Cipolla, "Multi-Task Learning Using Uncertainty
-    to Weigh Losses" (arXiv:1705.07115), CVPR 2018.
-    """
-
-    def __init__(self, num_tasks: int = 3):
-        super().__init__()
-        # Initialize log(σ²) = 0 → σ² = 1 → equal weighting initially
-        self.log_vars = torch.nn.Parameter(torch.zeros(num_tasks, device=DEVICE))
-
-    def forward(self, *losses: torch.Tensor) -> torch.Tensor:
-        total = torch.tensor(0.0, device=DEVICE)
-        for i, loss in enumerate(losses):
-            # Kendall et al.: L_i / (2σ²_i) + (1/2)log(σ²_i)
-            # With log_var = log(σ²): precision = exp(-log_var) = 1/σ²
-            precision = torch.exp(-self.log_vars[i])  # 1/σ²
-            total = total + 0.5 * precision * loss + 0.5 * self.log_vars[i]
-        return total
 
 
 class AttributionCentroidTracker:
@@ -115,7 +83,7 @@ def compute_completeness_loss(
     W_eff: torch.Tensor,
     labels: torch.Tensor,
     classifier_forward_fn: Callable[[torch.Tensor], torch.Tensor],
-    circuit_fraction: float = CIRCUIT_FRACTION,
+    circuit_fraction: float = 0.1,
     temperature: float = CIRCUIT_TEMPERATURE,
 ) -> torch.Tensor:
     """Differentiable circuit completeness via unified soft masking.
@@ -133,7 +101,11 @@ def compute_completeness_loss(
 def compute_separation_loss(
     centroid_tracker: AttributionCentroidTracker,
 ) -> torch.Tensor:
-    """Mean pairwise cosine similarity between class attribution centroids."""
+    """Orthogonality loss: mean pairwise cosine similarity between class attribution centroids.
+
+    Encourages each class to use a distinct subset of the vocabulary space,
+    enabling surgical per-class concept removal at the sparse bottleneck.
+    """
     centroids = centroid_tracker.get_normalized_centroids()
     n = centroids.shape[0]
     if n < 2:

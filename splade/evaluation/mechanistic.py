@@ -12,7 +12,6 @@ from splade.circuits.metrics import (VocabularyCircuit,
                                      measure_separation_cosine,
                                      measure_separation_jaccard,
                                      visualize_circuit)
-from splade.training.constants import CIRCUIT_FRACTION
 from splade.utils.cuda import COMPUTE_DTYPE, DEVICE, unwrap_compiled
 
 
@@ -23,6 +22,7 @@ class MechanisticResults:
     circuit_completeness: dict[int, float] = field(default_factory=dict)
     semantic_fidelity: dict = field(default_factory=dict)
     dla_verification_error: float = 0.0
+    mean_active_dims: float = 0.0
     eraser_metrics: dict = field(default_factory=dict)
     explainer_comparison: dict = field(default_factory=dict)
     layerwise_attribution: dict = field(default_factory=dict)
@@ -104,7 +104,7 @@ def run_mechanistic_evaluation(
     labels: list[int],
     tokenizer,
     num_classes: int,
-    circuit_fraction: float = CIRCUIT_FRACTION,
+    circuit_fraction: float = 0.1,
     run_sae_comparison: bool = False,
     centroid_tracker=None,
 ) -> MechanisticResults:
@@ -114,6 +114,7 @@ def run_mechanistic_evaluation(
 
     # 1. Verify DLA invariant: sum(s_j * W_eff[c,j]) + b_eff_c == logit_c
     total_error = 0.0
+    total_active_dims = 0.0
     correct = 0
     n = 0
     eval_batch = 32
@@ -128,6 +129,7 @@ def run_mechanistic_evaluation(
 
         preds = logits.argmax(dim=-1)
         correct += (preds == batch_labels_t).sum().item()
+        total_active_dims += (sparse_vector > 0).sum(dim=-1).float().sum().item()
 
         attr = compute_attribution_tensor(sparse_vector, W_eff, batch_labels_t)
         actual = logits.gather(1, batch_labels_t.unsqueeze(1)).squeeze(1)
@@ -137,6 +139,7 @@ def run_mechanistic_evaluation(
 
     results.accuracy = correct / n if n > 0 else 0.0
     results.dla_verification_error = total_error / n if n > 0 else 0.0
+    results.mean_active_dims = total_active_dims / n if n > 0 else 0.0
 
     # 2. Extract circuits per class
     for class_idx in range(num_classes):
@@ -220,76 +223,51 @@ def run_mechanistic_evaluation(
 
 
 def print_mechanistic_results(results: MechanisticResults) -> None:
+    """Print tiered evaluation report.
+
+    Tier 1 (Performance): Always shown.
+    Tier 2 (Faithfulness): Shown if DLA verification passes (error < 0.01).
+    Tier 3 (Interpretability): Shown if Tier 2 passes.
+    """
     print("\n" + "=" * 80)
-    print("MECHANISTIC INTERPRETABILITY RESULTS")
+    print("CIS EVALUATION REPORT")
     print("=" * 80)
 
-    print(f"\n  Accuracy: {results.accuracy:.4f}")
+    # --- Tier 1: Performance ---
+    print("\n[Tier 1: Performance]")
+    print(f"  Accuracy:              {results.accuracy:.4f}")
     print(f"  DLA Verification Error: {results.dla_verification_error:.6f}")
 
-    if results.circuits:
-        print(f"\n--- VOCABULARY CIRCUITS ---")
-        for class_idx, circuit in sorted(results.circuits.items()):
-            completeness = results.circuit_completeness.get(class_idx, 0.0)
-            print(f"\n  Class {class_idx}: {len(circuit.token_ids)} tokens, "
-                  f"completeness={completeness:.4f}")
-            print(visualize_circuit(circuit))
+    tier1_pass = results.dla_verification_error < 0.01
+    if not tier1_pass:
+        print("\n  !! DLA verification failed (error >= 0.01). Skipping Tiers 2-3.")
+        print("=" * 80)
+        return
+
+    # --- Tier 2: Faithfulness ---
+    print("\n[Tier 2: Faithfulness]")
+    print(f"  Mean active dims:      {results.mean_active_dims:.1f}")
+
+    if results.circuit_completeness:
+        for class_idx, comp in sorted(results.circuit_completeness.items()):
+            n_tokens = len(results.circuits[class_idx].token_ids) if class_idx in results.circuits else 0
+            print(f"  Class {class_idx} completeness: {comp:.4f} ({n_tokens} circuit tokens)")
+
+    # --- Tier 3: Interpretability ---
+    print("\n[Tier 3: Interpretability]")
 
     if results.semantic_fidelity:
         sf = results.semantic_fidelity
-        print(f"\n--- SEPARATION METRICS ---")
         cos_sep = sf.get('cosine_separation')
         cos_str = f"{cos_sep:.4f}" if cos_sep is not None else "N/A (no trained centroids)"
-        print(f"  Cosine separation (primary): {cos_str}")
-        print(f"  Within-class consistency (Jaccard): {sf.get('within_class_consistency', 0):.4f}")
-        print(f"  Cross-class overlap (Jaccard): {sf.get('cross_class_overlap', 0):.4f}")
-        print(f"  Class separation (Jaccard): {sf.get('class_separation', 0):.4f}")
+        print(f"  Cosine separation:     {cos_str}")
 
-        if "class_top_tokens" in sf:
-            for c, tokens in sf["class_top_tokens"].items():
-                print(f"  Class {c} top tokens: {', '.join(tokens[:10])}")
-
-    if results.eraser_metrics:
-        er = results.eraser_metrics
-        print(f"\n--- ERASER FAITHFULNESS (FMM bottleneck-level) ---")
-        comp = er.get("comprehensiveness", {})
-        suff = er.get("sufficiency", {})
-        print(f"  AOPC Comprehensiveness: {er.get('aopc_comprehensiveness', 0):.4f}")
-        print(f"  AOPC Sufficiency:       {er.get('aopc_sufficiency', 0):.4f}")
-        print(f"  {'k%':<8} {'Comp':>10} {'Suff':>10}")
-        for k in sorted(comp.keys()):
-            print(f"  {k:<8.0%} {comp[k]:>10.4f} {suff.get(k, 0):>10.4f}")
-
-    if results.explainer_comparison:
-        print(f"\n--- EXPLAINER COMPARISON (ERASER metrics) ---")
-        header = f"  {'Method':<25} {'AOPC-C':>8} {'AOPC-S':>8} {'Time(s)':>10}"
-        print(header)
-        print(f"  {'-' * 55}")
-        for name, metrics in results.explainer_comparison.items():
-            print(
-                f"  {name:<25} "
-                f"{metrics.get('aopc_comp', 0):>8.4f} "
-                f"{metrics.get('aopc_suff', 0):>8.4f} "
-                f"{metrics.get('time_seconds', 0):>10.3f}"
-            )
-
-    if results.layerwise_attribution:
-        lw = results.layerwise_attribution
-        print(f"\n--- LAYERWISE ATTRIBUTION ---")
-        print(f"  Decomposition error: {lw.get('decomposition_error', 0):.4f}")
-        print(f"  Samples: {lw.get('num_samples', 0)}")
-        importance = lw.get("layer_importance", [])
-        if importance:
-            total = sum(importance) or 1.0
-            print(f"  {'Layer':<8} {'Importance':>12} {'Fraction':>10}")
-            for i, imp in enumerate(importance):
-                print(f"  {i:<8} {imp:>12.4f} {imp/total:>10.1%}")
-
-    if results.sae_comparison:
-        sae = results.sae_comparison
-        print(f"\n--- SAE BASELINE COMPARISON ---")
-        print(f"  DLA active tokens (mean): {sae.get('dla_active_tokens', 0):.1f}")
-        print(f"  SAE active features (mean): {sae.get('sae_active_features', 0):.1f}")
-        print(f"  SAE reconstruction error: {sae.get('reconstruction_error', 0):.4f}")
+    if results.circuits:
+        print("\n  Example circuits:")
+        for class_idx, circuit in sorted(results.circuits.items()):
+            tokens = circuit.token_names[:5]
+            scores = circuit.attribution_scores[:5]
+            token_strs = [f"{t}({s:.3f})" for t, s in zip(tokens, scores)]
+            print(f"    Class {class_idx}: {', '.join(token_strs)}")
 
     print("\n" + "=" * 80)

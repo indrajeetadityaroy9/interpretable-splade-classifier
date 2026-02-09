@@ -10,12 +10,10 @@ from splade.data.loader import infer_max_length
 from splade.circuits.geco import GECOController
 from splade.circuits.losses import (
     AttributionCentroidTracker,
-    UncertaintyWeighting,
     compute_completeness_loss,
     compute_separation_loss,
     compute_sharpness_loss,
 )
-from splade.training import constants as _C
 from splade.training.constants import (
     EARLY_STOP_PATIENCE,
     EMA_DECAY,
@@ -23,7 +21,6 @@ from splade.training.constants import (
     MAX_EPOCHS,
     WARMUP_RATIO,
 )
-from splade.training.losses import DocumentFrequencyTracker, compute_df_flops_reg
 from splade.training.optim import (_gradient_centralization,
                                    _build_param_groups,
                                    _infer_batch_size, _LRScheduler, find_lr)
@@ -80,6 +77,9 @@ def train_model(
     val_labels: list[int],
     max_length: int | None = None,
     batch_size: int | None = None,
+    target_accuracy: float | None = None,
+    sparsity_target: float = 0.1,
+    warmup_fraction: float = 0.2,
 ) -> "AttributionCentroidTracker":
     if max_length is None:
         max_length = infer_max_length(texts, tokenizer)
@@ -112,16 +112,7 @@ def train_model(
     optimal_lr = find_lr(model, loader, num_labels)
     print(f"LR range test -> optimal_lr={optimal_lr:.2e}")
 
-    # Uncertainty weighting: 3 learnable log-variance params for circuit losses
-    uncertainty_weighting = UncertaintyWeighting(num_tasks=3)
-
     param_groups = _build_param_groups(model, optimal_lr)
-    # Add uncertainty weighting params to optimizer (same LR, no decay)
-    param_groups.append({
-        "params": list(uncertainty_weighting.parameters()),
-        "lr": optimal_lr,
-        "weight_decay": 0.0,
-    })
     optimizer = torch.optim.AdamW(param_groups, fused=True)
 
     steps_per_epoch = -(-len(texts) // batch_size)
@@ -132,7 +123,6 @@ def train_model(
 
     _orig = unwrap_compiled(model)
     vocab_size = _orig.padded_vocab_size
-    df_tracker = DocumentFrequencyTracker(vocab_size=vocab_size)
     classifier_params = set(_orig.classifier_parameters())
 
     criterion = (
@@ -148,11 +138,10 @@ def train_model(
         num_classes=num_labels, vocab_size=vocab_size,
     )
     geco = GECOController(steps_per_epoch=steps_per_epoch)
-    circuit_delay_steps = int(_C.CIRCUIT_WARMUP_FRACTION * total_steps)
-    # Patience reset at 20% of total steps regardless of whether circuits activate.
-    # This ensures ablation baseline and full CIS have identical training horizons.
-    _PATIENCE_RESET_FRACTION = 0.2
-    patience_reset_step = int(_PATIENCE_RESET_FRACTION * total_steps)
+    if target_accuracy is not None:
+        geco.tau_ce = target_accuracy
+    circuit_delay_steps = int(warmup_fraction * total_steps)
+    patience_reset_step = int(warmup_fraction * total_steps)
     patience_was_reset = False
     global_step = 0
     warmup_finalized = False
@@ -177,7 +166,6 @@ def train_model(
 
     model.train()
     for epoch_index in range(MAX_EPOCHS):
-        df_tracker.soft_reset()
         total_loss = torch.zeros(1, device=DEVICE)
         batch_count = 0
 
@@ -200,9 +188,6 @@ def train_model(
                     else criterion(logits, batch_labels.view(-1))
                 )
 
-                df_tracker.update(sparse)
-                df_loss = compute_df_flops_reg(sparse, df_tracker.get_weights())
-
                 global_step += 1
 
                 # Reset patience at fixed point for both baseline and CIS
@@ -211,27 +196,30 @@ def train_model(
                     patience_counter = 0
 
                 if global_step < circuit_delay_steps:
-                    # Warmup: CE + DF-FLOPS only, record CE for GECO tau
-                    loss = classification_loss + df_loss
-                    geco.record_warmup_ce(classification_loss.detach().item())
+                    # Warmup: CE only, record CE for GECO tau
+                    loss = classification_loss
+                    if target_accuracy is None:
+                        geco.record_warmup_ce(classification_loss.detach().item())
                 else:
                     if not warmup_finalized:
-                        tau = geco.finalize_warmup()
-                        print(f"GECO: tau_ce={tau:.4f}")
+                        if target_accuracy is None:
+                            tau = geco.finalize_warmup()
+                            print(f"GECO: tau_ce={tau:.4f}")
+                        else:
+                            print(f"GECO: tau_ce={target_accuracy:.4f} (from config)")
                         warmup_finalized = True
 
                     cc_loss = compute_completeness_loss(
                         sparse, W_eff, batch_labels.view(-1),
                         _orig.classifier_logits_only,
+                        circuit_fraction=sparsity_target,
                     )
                     sep_loss = compute_separation_loss(centroid_tracker)
                     sharp_loss = compute_sharpness_loss(
                         sparse, W_eff, batch_labels.view(-1),
                     )
 
-                    # Uncertainty weighting: learnable σ² per loss
-                    weighted_circuit_loss = uncertainty_weighting(cc_loss, sep_loss, sharp_loss)
-                    circuit_objective = weighted_circuit_loss + df_loss
+                    circuit_objective = cc_loss + sep_loss + sharp_loss
                     loss = geco.compute_loss(classification_loss, circuit_objective)
 
                     centroid_tracker.update(
@@ -251,11 +239,15 @@ def train_model(
         average_loss = total_loss.item() / batch_count
         epoch_msg = f"Epoch {epoch_index + 1}: Loss = {average_loss:.4f}"
 
-        stats = df_tracker.get_stats()
-        epoch_msg += f", Top-1 DF: {stats['top1_df_pct']:.1f}%"
-
         if warmup_finalized:
             epoch_msg += f", GECO lambda={geco.lambda_ce:.4f}"
+            if abs(geco._log_lambda) >= 4.9:
+                print(
+                    f"\n  [WARNING] GECO lambda pinned at {geco.lambda_ce:.2f} "
+                    f"(log_lambda={geco._log_lambda:.2f}, "
+                    f"constraint_ema={geco._ema_constraint:.4f}). "
+                    f"Model is {'sacrificing interpretability for accuracy' if geco._log_lambda > 0 else 'over-constraining accuracy'}."
+                )
         else:
             epoch_msg += ", GECO: warming up"
 

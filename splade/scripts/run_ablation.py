@@ -3,20 +3,19 @@
 Two-variant ablation to demonstrate that circuit training losses
 produce measurably better circuits than baseline:
 
-  1. Baseline:  No circuit losses (CIRCUIT_WARMUP_FRACTION=1.1)
-  2. Full CIS:  All circuit losses active with uncertainty weighting
+  1. Baseline:  No circuit losses (warmup_fraction=1.1, never exits warmup)
+  2. Full CIS:  All circuit losses active
 """
 
 import argparse
+import copy
 import json
 import os
-from unittest.mock import patch
 
 from splade.config.load import load_config
 from splade.evaluation.mechanistic import (print_mechanistic_results,
                                            run_mechanistic_evaluation)
 from splade.pipelines import prepare_mechanistic_inputs, setup_and_train
-from splade.training import constants
 
 
 def _run_variant(config, seed, name):
@@ -64,11 +63,12 @@ def main() -> None:
     print(f"\nAblation: {config.data.dataset_name}, {config.data.train_samples} train, "
           f"{config.data.test_samples} test, seed={seed}")
 
-    # Variant 1: Baseline — no circuit losses
-    with patch.object(constants, "CIRCUIT_WARMUP_FRACTION", 1.1):
-        baseline = _run_variant(config, seed, "Baseline (no circuit losses)")
+    # Variant 1: Baseline — no circuit losses (warmup never ends)
+    baseline_config = copy.deepcopy(config)
+    baseline_config.training.warmup_fraction = 1.1
+    baseline = _run_variant(baseline_config, seed, "Baseline (no circuit losses)")
 
-    # Variant 2: Full CIS — all circuit losses with uncertainty weighting
+    # Variant 2: Full CIS — all circuit losses active
     full_cis = _run_variant(config, seed, "Full CIS")
 
     # Comparison table

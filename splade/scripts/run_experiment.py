@@ -23,7 +23,7 @@ def _print_cis_config(config: Config) -> None:
     """Print CIS experiment configuration."""
     train_str = "full" if config.data.train_samples <= 0 else str(config.data.train_samples)
     test_str = "full" if config.data.test_samples <= 0 else str(config.data.test_samples)
-    print("\n--- Circuit-Integrated SPLADE (CIS) ---")
+    print("\n--- Lexical-SAE (Circuit-Integrated SPLADE) ---")
     print(f"  Model:       {config.model.name}")
     print(f"  Dataset:     {config.data.dataset_name} (train={train_str}, test={test_str})")
     print(f"  Seeds:       {config.evaluation.seeds}")
@@ -72,6 +72,7 @@ def run_experiment(config: Config) -> list[dict]:
             "seed": seed,
             "accuracy": exp.accuracy,
             "dla_verification_error": mechanistic_results.dla_verification_error,
+            "mean_active_dims": mechanistic_results.mean_active_dims,
             "semantic_fidelity": mechanistic_results.semantic_fidelity,
             "eraser_metrics": mechanistic_results.eraser_metrics,
             "explainer_comparison": mechanistic_results.explainer_comparison,

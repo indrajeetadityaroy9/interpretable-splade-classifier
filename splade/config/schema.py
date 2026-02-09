@@ -14,6 +14,13 @@ class ModelConfig:
 
 
 @dataclass
+class TrainingConfig:
+    target_accuracy: float | None = None  # GECO tau override; None = auto from warmup
+    sparsity_target: float = 0.1          # circuit_fraction (top k% of active dims)
+    warmup_fraction: float = 0.2          # fraction of training for CE-only warmup
+
+
+@dataclass
 class MechanisticConfig:
     circuit_fraction: float = 0.1
     sae_comparison: bool = False
@@ -32,3 +39,4 @@ class Config:
     model: ModelConfig
     evaluation: EvaluationConfig
     mechanistic: MechanisticConfig = field(default_factory=MechanisticConfig)
+    training: TrainingConfig = field(default_factory=TrainingConfig)

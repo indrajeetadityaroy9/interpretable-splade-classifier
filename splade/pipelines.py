@@ -13,7 +13,7 @@ from splade.config.schema import Config
 from splade.circuits.losses import AttributionCentroidTracker
 from splade.data.loader import infer_max_length, load_dataset_by_name
 from splade.inference import score_model
-from splade.models.splade import SpladeModel
+from splade.models.splade import CISModel
 from splade.training.loop import train_model
 from splade.training.optim import _infer_batch_size
 from splade.utils.cuda import DEVICE, set_seed
@@ -56,7 +56,7 @@ def setup_and_train(config: Config, seed: int) -> TrainedExperiment:
     train_texts_split = train_texts[:-val_size]
     train_labels_split = train_labels[:-val_size]
 
-    model = SpladeModel(config.model.name, num_labels).to(DEVICE)
+    model = CISModel(config.model.name, num_labels).to(DEVICE)
     # torch.compile disabled: bf16 autocast dtype mismatch with distilbert
     # on PyTorch 2.7 (addmm gets Float vs BFloat16). Batched eval loops
     # provide the main throughput improvement.
@@ -67,6 +67,9 @@ def setup_and_train(config: Config, seed: int) -> TrainedExperiment:
         model_name=config.model.name, num_labels=num_labels,
         val_texts=val_texts, val_labels=val_labels,
         max_length=max_length, batch_size=batch_size,
+        target_accuracy=config.training.target_accuracy,
+        sparsity_target=config.training.sparsity_target,
+        warmup_fraction=config.training.warmup_fraction,
     )
 
     accuracy = score_model(

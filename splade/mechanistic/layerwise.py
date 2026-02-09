@@ -45,7 +45,7 @@ def decompose_sparse_vector_by_layer(
     measures the change in sparse_vector.
 
     Args:
-        model: SpladeModel.
+        model: CISModel.
         input_ids: [B, L] token IDs.
         attention_mask: [B, L] attention mask.
 
@@ -101,7 +101,7 @@ def compute_layerwise_attribution(
         layer_importance[b, l] = sum_j |end_to_end[b, l, j]|
 
     Args:
-        model: SpladeModel.
+        model: CISModel.
         input_ids: [B, L] token IDs.
         attention_mask: [B, L] attention mask.
         target_classes: [B] class indices.

@@ -198,51 +198,6 @@ class TestGECOController:
         assert geco.lambda_ce < 200  # bounded
 
 
-class TestUncertaintyWeighting:
-    def test_equal_weighting_at_init(self):
-        from splade.circuits.losses import UncertaintyWeighting
-        uw = UncertaintyWeighting(num_tasks=3)
-        # At init, log_vars = [0, 0, 0] → σ² = 1 → precision = 1
-        # Each task: 0.5 * 1.0 * L_i + 0.5 * 0 = 0.5 * L_i
-        # Total = 0.5 * (L1 + L2 + L3)
-        losses = [torch.tensor(1.0), torch.tensor(1.0), torch.tensor(1.0)]
-        total = uw(*losses)
-        assert abs(total.item() - 1.5) < 1e-5
-
-    def test_differentiable(self):
-        from splade.circuits.losses import UncertaintyWeighting
-        uw = UncertaintyWeighting(num_tasks=2)
-        l1 = torch.tensor(1.0, requires_grad=True)
-        l2 = torch.tensor(2.0, requires_grad=True)
-        total = uw(l1, l2)
-        total.backward()
-        assert l1.grad is not None
-        assert l2.grad is not None
-
-    def test_high_variance_downweights(self):
-        from splade.circuits.losses import UncertaintyWeighting
-        uw = UncertaintyWeighting(num_tasks=2)
-        # Manually set log_var[0] = 4 (high variance → low precision)
-        with torch.no_grad():
-            uw.log_vars[0] = 4.0
-            uw.log_vars[1] = 0.0
-        l1 = torch.tensor(1.0)
-        l2 = torch.tensor(1.0)
-        total = uw(l1, l2)
-        # Task 0: 0.5 * exp(-4)*1 + 0.5*4 = 0.5*0.018 + 2.0 ≈ 2.009
-        # Task 1: 0.5 * exp(0)*1 + 0.5*0 = 0.5
-        # The effective weight on l1 is 0.5*exp(-4) ≈ 0.009, much less than 0.5 on l2
-        # Verify l1's effective contribution is much smaller
-        # Compare: with equal weights (both log_var=0), total = 1.0
-        uw_equal = UncertaintyWeighting(num_tasks=2)
-        total_equal = uw_equal(l1, l2)
-        # The high-variance task adds more total (from regularizer) but contributes
-        # less effective weight to its loss
-        effective_weight_l1 = 0.5 * torch.exp(-uw.log_vars[0]).item()
-        effective_weight_l2 = 0.5 * torch.exp(-uw.log_vars[1]).item()
-        assert effective_weight_l1 < effective_weight_l2 * 0.1  # Much less weight
-
-
 class TestHoyerSparsity:
     def test_one_hot_is_maximally_sparse(self):
         """Hoyer sparsity of a one-hot vector should be close to 1.0."""
@@ -271,33 +226,6 @@ class TestHoyerSparsity:
         loss = compute_sharpness_loss(sparse, w_eff, labels)
         # Hoyer of uniform ≈ 0.0, so loss = 1 - 0.0 ≈ 1.0
         assert loss.item() > 0.9
-
-
-class TestDfFlopsReg:
-    def test_scale_invariance(self):
-        """L1/L2 ratio should be scale-invariant."""
-        from splade.training.losses import compute_df_flops_reg
-
-        activations = torch.rand(8, 100).abs()
-        df_weights = torch.rand(100).abs()
-
-        loss_1x = compute_df_flops_reg(activations, df_weights)
-        loss_10x = compute_df_flops_reg(activations * 10.0, df_weights)
-        # Scale-invariant: multiplying activations by constant should not change the ratio
-        assert abs(loss_1x.item() - loss_10x.item()) < 0.01
-
-    def test_sparse_less_than_dense(self):
-        """Sparse activations should have lower L1/L2 penalty than dense."""
-        from splade.training.losses import compute_df_flops_reg
-
-        dense = torch.ones(4, 100)
-        sparse = torch.zeros(4, 100)
-        sparse[:, :5] = 1.0  # only 5% active
-        df_weights = torch.ones(100)
-
-        loss_dense = compute_df_flops_reg(dense, df_weights)
-        loss_sparse = compute_df_flops_reg(sparse, df_weights)
-        assert loss_sparse.item() < loss_dense.item()
 
 
 class TestGradientCentralization:
@@ -359,3 +287,12 @@ class TestRemovedConstants:
     def test_no_centroid_momentum(self):
         from splade.training import constants
         assert not hasattr(constants, "CENTROID_MOMENTUM")
+
+    def test_no_df_momentum(self):
+        from splade.training import constants
+        assert not hasattr(constants, "DF_MOMENTUM")
+
+    def test_no_circuit_fraction_in_constants(self):
+        from splade.training import constants
+        assert not hasattr(constants, "CIRCUIT_FRACTION")
+        assert not hasattr(constants, "CIRCUIT_WARMUP_FRACTION")

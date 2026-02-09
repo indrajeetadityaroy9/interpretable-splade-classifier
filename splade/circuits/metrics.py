@@ -11,7 +11,6 @@ from dataclasses import dataclass, field
 import torch
 
 from splade.mechanistic.attribution import compute_attribution_tensor
-from splade.training.constants import CIRCUIT_FRACTION
 from splade.utils.cuda import COMPUTE_DTYPE, DEVICE, unwrap_compiled
 
 
@@ -31,7 +30,7 @@ def extract_vocabulary_circuit(
     attention_mask_list: list[torch.Tensor],
     tokenizer,
     class_idx: int,
-    circuit_fraction: float = CIRCUIT_FRACTION,
+    circuit_fraction: float = 0.1,
     precomputed_attributions: torch.Tensor | None = None,
 ) -> VocabularyCircuit:
     """Extract vocabulary circuit as the top fraction of ACTIVE dimensions.

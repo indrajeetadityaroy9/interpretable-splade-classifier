@@ -1,8 +1,10 @@
-# Circuit-Integrated SPLADE (CIS)
+# Lexical-SAE
 
-**Training Text Classifiers with Mechanistic Interpretability Objectives**
+**A Supervised Exact Sparse Autoencoder for Interpretable Text Classification**
 
-CIS repurposes SPLADE's sparse lexical bottleneck for classification and exploits the resulting piecewise-linear structure to obtain **exact** per-token attribution from a single forward pass. Three differentiable circuit losses---computed by the *same function* used for evaluation---are optimized during training via constrained Lagrangian optimization, producing models with cleaner internal circuits without sacrificing accuracy.
+Lexical-SAE repurposes SPLADE's sparse lexical bottleneck as an intrinsically interpretable classifier with three properties that post-hoc sparse autoencoders cannot provide: **(1)** zero reconstruction error (algebraic identity, not approximation), **(2)** intrinsic alignment via training-time circuit constraints, and **(3)** surgical concept removal with mathematical guarantees.
+
+The feature dictionary is the tokenizer vocabulary itself. No feature splitting ambiguity, no "what is feature #1405?" --- if the model learns a spurious correlation between "Muslim" and toxicity, you can identify it by name, surgically zero its contribution, and mathematically verify the bias is removed.
 
 ---
 
@@ -18,42 +20,45 @@ logit_c  = sum_j [ s_j * W_eff(s)[c,j] ] + b_eff(s)_c      (algebraic identity, 
 
 This **Direct Logit Attribution (DLA)** decomposes every prediction into per-token contributions at zero cost. Verification error is ~0.001 (machine precision for BF16).
 
-### Training
-
-CIS minimizes circuit structure losses subject to a classification performance constraint:
+### Architecture
 
 ```
-minimize     L_completeness + L_separation + L_sharpness + L_DF-FLOPS
+Input -> BERT/ModernBERT -> Vocab Transform (Dense+GELU+LN) -> MLM Logits -> DReLU
+      -> Sparse Vector (max-pool, ~100-200 of ~30K dims active)
+      -> ReLU MLP (fc1 -> fc2) -> Logits + W_eff + b_eff
+```
+
+The sparse bottleneck is a **Faithfulness Measurable Model** ([Madsen et al., 2024](https://arxiv.org/abs/2310.01538)): zeroing `s_j` entries causes no distribution shift, unlike input-space token erasure.
+
+### Training
+
+Three circuit losses optimized via GECO constrained optimization:
+
+```
+minimize     L_completeness + L_separation + L_sharpness
 subject to   L_CE <= tau_ce
 ```
 
 | Loss | Objective | Mechanism |
 |------|-----------|-----------|
 | **Completeness** | Circuit-masked predictions match full | DLA &rarr; soft top-k mask &rarr; reclassify &rarr; CE |
-| **Separation** | Per-class circuits use distinct tokens | EMA centroids &rarr; mean pairwise cosine |
+| **Separation** | Per-class circuits use distinct tokens | EMA centroids &rarr; mean pairwise cosine (orthogonality) |
 | **Sharpness** | Attributions concentrate on few dims | Hoyer sparsity of attribution magnitudes |
-| **DF-FLOPS** | Sparse bottleneck stays sparse | Scale-invariant L1/L2 document frequency reg |
 
-The constraint threshold `tau_ce` is set automatically from the 25th percentile of warmup CE. A single GECO Lagrangian multiplier ([Rezende & Viola, 2018](https://arxiv.org/abs/1810.00597)) replaces manual loss weighting. Loss weights within the circuit objective are learned via uncertainty weighting ([Kendall et al., 2018](https://arxiv.org/abs/1705.07115)).
+The constraint threshold `tau_ce` is set automatically from the 25th percentile of warmup CE. A single GECO Lagrangian multiplier ([Rezende & Viola, 2018](https://arxiv.org/abs/1810.00597)) replaces manual loss weighting.
 
 **Key invariant**: `compute_attribution_tensor()` is a single function called by both training losses and evaluation metrics. There is no separate training-time vs. evaluation-time attribution.
 
-### Evaluation
+### Surgical Intervention
 
-An 8-step mechanistic evaluation pipeline runs automatically after training:
+Two mechanisms for verifiable concept removal at the sparse bottleneck:
 
-| Step | Metric | What it measures |
-|------|--------|-----------------|
-| 1 | DLA verification | Algebraic identity holds to machine precision |
-| 2 | Circuit extraction | Top-k% of *active* vocab dims by attribution |
-| 3 | Completeness | Per-class accuracy retention under circuit ablation |
-| 4 | Separation | Cosine + Jaccard separation between class circuits |
-| 5 | ERASER faithfulness | Comprehensiveness / sufficiency / AOPC at sparse bottleneck |
-| 6 | Explainer comparison | DLA vs gradient vs IG vs attention (ERASER metrics) |
-| 7 | Layerwise attribution | Per-BERT-layer contribution decomposition |
-| 8 | SAE comparison | Optional sparse autoencoder baseline |
+| Mechanism | Scope | Reversible | Guarantee |
+|-----------|-------|------------|-----------|
+| **Global suppression** (`suppress_token_globally`) | Zeros vocab_projector weights + DReLU threshold | No | `s[token_id] = 0` for all inputs, mathematically provable |
+| **Inference-time masking** (`SuppressedCISModel`) | Masks sparse vector before classifier | Yes | DLA identity preserved with fewer active dims |
 
-ERASER metrics ([DeYoung et al., 2020](https://arxiv.org/abs/1911.03429)) operate at the sparse bottleneck level, not input tokens. Zeroing `s_j` entries causes no distribution shift---a **Faithfulness Measurable Model** property ([Madsen et al., 2024](https://arxiv.org/abs/2310.01538)).
+Since `logit[c] = sum_j s[j] * W_eff[c,j] + b_eff[c]`, zeroing `s[j]` removes token j's contribution to ALL classes with mathematical certainty.
 
 ---
 
@@ -71,33 +76,36 @@ pip install -e .
 
 ## Reproducing Results
 
-All paper experiments use full dataset splits (`train_samples: -1, test_samples: -1`).
+### Core Experiments
 
 ```bash
-# Main experiment (SST-2, full split, single seed)
+# Main experiment (SST-2, full split)
 python -m splade.scripts.run_experiment --config experiments/paper/sst2.yaml
 
-# Ablation: Baseline (no circuit losses) vs Full CIS
+# Ablation: Baseline (no circuit losses) vs Full Lexical-SAE
 python -m splade.scripts.run_ablation --config experiments/paper/sst2_ablation.yaml
 
 # Multi-dataset benchmark (SST-2, AG News, IMDB)
 python -m splade.scripts.run_multi_dataset --config experiments/paper/multi_dataset.yaml
 ```
 
-Additional datasets and configurations:
+### Hero Experiments
 
 ```bash
-# AG News (4-class)
-python -m splade.scripts.run_experiment --config experiments/paper/ag_news.yaml
+# Experiment A: Faithfulness Stress Test
+# Compares DLA removability vs gradient/IG/attention baselines
+python -m splade.scripts.run_faithfulness --config experiments/civilcomments.yaml
 
-# IMDB (binary)
-python -m splade.scripts.run_experiment --config experiments/paper/imdb.yaml
+# Experiment B: Surgical Bias Removal ("Lobotomy")
+# Suppresses identity-correlated tokens, measures FPR gap reduction
+python -m splade.scripts.run_surgery --config experiments/surgery.yaml
 
-# B-cos architecture variant (exact DLA at arbitrary depth)
-python -m splade.scripts.run_bcos_ablation --config experiments/paper/sst2.yaml
+# Experiment C: Long-Context Needle in Haystack
+# Tests sparse bottleneck signal preservation at increasing document lengths
+python -m splade.scripts.run_long_context --config experiments/long_context.yaml
 ```
 
-Quick verification runs (toy-sized, for development):
+### Quick Verification
 
 ```bash
 python -m splade.scripts.run_experiment --config experiments/verify_full.yaml
@@ -115,6 +123,9 @@ All loaded automatically from HuggingFace `datasets`:
 | AG News | Topic | 4 | 120,000 | 7,600 |
 | IMDB | Sentiment | 2 | 25,000 | 25,000 |
 | Yelp | Polarity | 2 | 560,000 | 38,000 |
+| CivilComments | Toxicity | 2 | 1,804,874 | 97,320 |
+
+CivilComments includes 24 identity group annotations for bias analysis (male, female, transgender, muslim, christian, jewish, black, white, etc.).
 
 ---
 
@@ -123,13 +134,12 @@ All loaded automatically from HuggingFace `datasets`:
 ```
 splade/
   models/
-    splade.py              # SpladeModel: BERT + sparse bottleneck + ReLU MLP -> CircuitState
-    bcos.py                # B-cos linear layers (exact DLA at arbitrary depth)
+    splade.py              # CISModel: BERT/ModernBERT + sparse bottleneck + ReLU MLP -> CircuitState
     layers/activation.py   # DReLU with learnable thresholds
   circuits/
     core.py                # CircuitState NamedTuple, circuit_mask()
     geco.py                # GECOController: dataset-size-invariant Lagrangian optimization
-    losses.py              # Completeness, separation, sharpness + uncertainty weighting
+    losses.py              # Completeness, separation (orthogonality), sharpness
     metrics.py             # Circuit extraction, completeness, cosine/Jaccard separation
   mechanistic/
     attribution.py         # compute_attribution_tensor(): canonical DLA for all consumers
@@ -137,46 +147,74 @@ splade/
     sae.py                 # Sparse autoencoder baseline
   evaluation/
     eraser.py              # ERASER comprehensiveness, sufficiency, AOPC
+    faithfulness.py        # Removability metric: prediction flip rate under DLA-guided ablation
     baselines.py           # Gradient, IG, attention attribution methods
     compare_explainers.py  # Side-by-side ERASER comparison across explainers
-    mechanistic.py         # 8-step evaluation pipeline orchestrator
+    mechanistic.py         # Tiered evaluation pipeline (Performance -> Faithfulness -> Interpretability)
+  intervene.py             # Surgical intervention: suppress_token_globally, SuppressedCISModel, evaluate_bias
   training/
-    loop.py                # GECO-integrated training with EMA and early stopping
-    losses.py              # DF-FLOPS regularization
+    loop.py                # GECO-integrated training with EMA, early stopping, lambda pinning alerts
     optim.py               # LR range test, gradient centralization
-    constants.py           # All hyperparameters (hardwired, not configurable)
-  data/loader.py           # HuggingFace dataset loading
+    constants.py           # Internal hyperparameters (not user-configurable)
+  data/loader.py           # HuggingFace dataset loading + CivilComments identity annotations
+  inference.py             # Batched inference, prediction, explanation API
+  pipelines.py             # Shared setup_and_train() pipeline
+  config/
+    schema.py              # Dataclass config: 3 training knobs (target_accuracy, sparsity_target, warmup_fraction)
+    load.py                # YAML -> Config
   scripts/
-    run_experiment.py      # Train + evaluate pipeline
-    run_ablation.py        # Baseline vs Full CIS comparison
+    run_experiment.py      # Train + mechanistic evaluation
+    run_ablation.py        # Baseline vs Full Lexical-SAE comparison
     run_multi_dataset.py   # Cross-dataset benchmark
-    run_bcos_ablation.py   # B-cos architecture comparison
+    run_faithfulness.py    # Experiment A: removability comparison
+    run_surgery.py         # Experiment B: surgical bias removal
+    run_long_context.py    # Experiment C: needle in haystack
 experiments/
-  paper/                   # Publication configs (full splits, single seed)
+  paper/                   # Publication configs (full splits)
+  civilcomments.yaml       # CivilComments experiment config
+  surgery.yaml             # Bias removal experiment config
+  long_context.yaml        # Long-context experiment config
   verify*.yaml             # Quick verification configs (toy-sized)
-tests/                     # 143 unit tests
+tests/                     # Unit tests
+archive/                   # B-cos variant (not part of core contribution)
 ```
+
+---
+
+## Configuration
+
+Three training knobs exposed via YAML `training:` section:
+
+| Knob | Default | Effect |
+|------|---------|--------|
+| `target_accuracy` | `null` (auto) | GECO tau_ce override. Null = auto from warmup 25th percentile |
+| `sparsity_target` | `0.1` | Circuit fraction: top 10% of active sparse dims |
+| `warmup_fraction` | `0.2` | Fraction of training for CE-only warmup before circuit losses activate |
+
+All other hyperparameters (LR schedule, EMA decay, GECO dynamics, etc.) are derived automatically or hardwired.
 
 ---
 
 ## Design Decisions
 
-**No configurable hyperparameters.** All training hyperparameters (learning rate schedule, loss weights, circuit fraction, GECO dynamics) are hardwired constants or derived automatically. YAML configs specify only the experimental setup: dataset, model, and seeds.
+**Feature dictionary = tokenizer vocabulary.** Unlike post-hoc SAEs which learn an opaque feature dictionary requiring interpretation, Lexical-SAE operates directly in vocabulary space. Each sparse dimension corresponds to a known token. This makes surgical intervention auditable: if the model relies on an identity term like "Muslim" to predict toxicity, you can identify that spurious correlation by name and remove it with a single operation --- no guessing what "feature #1405" represents.
 
-**Single attribution function.** `compute_attribution_tensor()` is called by training losses, evaluation metrics, circuit extraction, and centroid tracking. This eliminates the common failure mode where training optimizes a proxy that diverges from the evaluation metric.
+**Zero reconstruction error.** The DLA identity `logit_c = sum_j s_j * W_eff[c,j] + b_eff_c` holds exactly (verified to BF16 machine precision). Post-hoc SAEs incur reconstruction error that compounds through downstream layers.
 
-**GECO over fixed loss weights.** A single Lagrangian multiplier adapts automatically to balance classification and circuit objectives. The dual step size scales with `1/steps_per_epoch` for dataset-size-invariant behavior.
+**Intrinsic alignment.** Circuit structure (completeness, separation, sharpness) is optimized during training, not extracted post-hoc. The same `compute_attribution_tensor()` function drives both training losses and evaluation metrics.
 
-**Sparse bottleneck as FMM.** The vocabulary-sized sparse vector `s` has ~100-200 non-zero dimensions out of ~30K. Zeroing entries for faithfulness evaluation causes no distribution shift, unlike input-space token erasure.
+**GECO over fixed loss weights.** A single Lagrangian multiplier adapts automatically. Lambda pinning detection alerts when the accuracy-interpretability trade-off becomes infeasible.
+
+**Sparse bottleneck as FMM.** ~100-200 non-zero dimensions out of ~30K vocabulary. Zeroing entries for faithfulness evaluation or surgical intervention causes no distribution shift.
 
 ---
 
 ## Limitations
 
 - **Text classification only.** The architecture requires a sparse vocabulary bottleneck; not applicable to generation or retrieval.
-- **BERT-family encoders.** Tested with DistilBERT and BERT-base. Other encoder families may require adaptation.
-- **Vocabulary-level granularity.** Attributions identify vocabulary tokens, not input spans. Subword tokenization may split meaningful units.
-- **Input-dependent W_eff.** The effective weight matrix varies per input due to the ReLU activation mask; explanations are per-sample.
+- **Vocabulary-level granularity.** Attributions identify vocabulary tokens, not input spans. A clean vocab filter masks subwords (`##ing`) and special tokens for human-readable output.
+- **Input-dependent W_eff.** The effective weight matrix varies per input due to the ReLU activation mask; explanations are per-sample, not global.
+- **Encoder family support.** Tested with DistilBERT, BERT-base, and ModernBERT. Other encoder families may require MLM head path adaptation.
 
 ---
 
@@ -187,7 +225,6 @@ tests/                     # 143 unit tests
 - Formal, T., Piwowarski, B., & Clinchant, S. (2021). SPLADE: Sparse Lexical and Expansion Model for First Stage Ranking. *SIGIR*. [`arXiv:2107.05720`](https://arxiv.org/abs/2107.05720)
 - Balestriero, R. & Baraniuk, R. (2018). A Spline Theory of Deep Networks. *ICML*. [`arXiv:1802.09210`](https://arxiv.org/abs/1802.09210)
 - Rezende, D. J. & Viola, F. (2018). Taming VAEs. [`arXiv:1810.00597`](https://arxiv.org/abs/1810.00597)
-- Kendall, A., Gal, Y., & Cipolla, R. (2018). Multi-Task Learning Using Uncertainty to Weigh Losses. *CVPR*. [`arXiv:1705.07115`](https://arxiv.org/abs/1705.07115)
 
 ### Evaluation
 
@@ -198,7 +235,6 @@ tests/                     # 143 unit tests
 ### Related Work
 
 - Elhage, N., et al. (2021). A Mathematical Framework for Transformer Circuits. *Anthropic*.
-- Bohle, M., Fritz, M., & Schiele, B. (2024). B-cos Networks: Alignment is All We Need for Interpretability. *CVPR*. [`arXiv:2205.10268`](https://arxiv.org/abs/2205.10268)
 - Conmy, A., et al. (2023). Towards Automated Circuit Discovery for Mechanistic Interpretability. *NeurIPS*. [`arXiv:2304.14997`](https://arxiv.org/abs/2304.14997)
 - Marks, S., et al. (2024). Sparse Feature Circuits. *ICLR*. [`arXiv:2403.19647`](https://arxiv.org/abs/2403.19647)
 - Lei, T., et al. (2025). Sparse Attention Post-Training. [`arXiv:2512.05865`](https://arxiv.org/abs/2512.05865)

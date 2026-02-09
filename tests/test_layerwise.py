@@ -47,8 +47,8 @@ class FakeBERT(torch.nn.Module):
         return Output()
 
 
-class FakeSpladeModelWithBERT(torch.nn.Module):
-    """Minimal SpladeModel with fake BERT for testing layerwise decomposition."""
+class FakeCISModelWithBERT(torch.nn.Module):
+    """Minimal CISModel with fake BERT for testing layerwise decomposition."""
 
     def __init__(self, hidden_size=64, vocab_size=100, num_layers=3, num_labels=2):
         super().__init__()
@@ -99,7 +99,7 @@ class FakeSpladeModelWithBERT(torch.nn.Module):
 @pytest.fixture
 def model():
     torch.manual_seed(42)
-    return FakeSpladeModelWithBERT(num_layers=3)
+    return FakeCISModelWithBERT(num_layers=3)
 
 
 @pytest.fixture
