@@ -1,0 +1,13 @@
+experiment_name: "esnli_distilbert"
+output_dir: "results/datasets/esnli"
+
+data:
+  dataset_name: "esnli"
+  train_samples: -1  # full split: ~549,000
+  test_samples: -1   # full split: ~9,800
+
+model:
+  name: "distilbert-base-uncased"
+
+evaluation:
+  seeds: [42]

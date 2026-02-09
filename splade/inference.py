@@ -1,8 +1,9 @@
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from splade.evaluation.constants import SPECIAL_TOKENS
 from splade.mechanistic.attribution import compute_attribution_tensor
+
+SPECIAL_TOKENS = {"[CLS]", "[SEP]", "[UNK]", "[MASK]", "[PAD]"}
 from splade.utils.cuda import COMPUTE_DTYPE, DEVICE
 
 def _run_inference_loop(
@@ -29,11 +30,11 @@ def _run_inference_loop(
             batch_ids = batch_ids.to(DEVICE, non_blocking=True)
             batch_mask = batch_mask.to(DEVICE, non_blocking=True)
             logits, sparse, w_eff, _ = model(batch_ids, batch_mask)
-            all_logits.append(logits)
+            all_logits.append(logits.clone())
             if extract_sparse:
-                all_sparse.append(sparse)
+                all_sparse.append(sparse.clone())
             if extract_weff:
-                all_weff.append(w_eff)
+                all_weff.append(w_eff.clone())
 
     logits = torch.cat(all_logits, dim=0)
     sparse = torch.cat(all_sparse, dim=0) if extract_sparse else None

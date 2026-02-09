@@ -20,5 +20,8 @@ dependencies = [
     "transformers>=4.30.0",
 ]
 
+[tool.pytest.ini_options]
+markers = ["slow: tests requiring network access (deselect with '-k not slow')"]
+
 [tool.setuptools.packages.find]
 include = ["splade*"]

@@ -1,6 +1,6 @@
 import torch
 
-from splade.training.constants import DF_ALPHA, DF_BETA, DF_MOMENTUM
+from splade.training.constants import DF_MOMENTUM
 from splade.utils.cuda import DEVICE
 
 
@@ -9,21 +9,19 @@ class DocumentFrequencyTracker:
         self.vocab_size = vocab_size
         self.df_counts = torch.zeros(vocab_size, device=DEVICE)
         self.doc_count = 0.0
-        self._log_2 = torch.log(torch.tensor(2.0, device=DEVICE))
-        log_alpha = torch.log(torch.tensor(DF_ALPHA, device=DEVICE))
-        log_alpha = torch.where(log_alpha.abs() < 1e-7, torch.tensor(1e-7, device=DEVICE), log_alpha)
-        self._cached_log_alpha_2 = self._log_2 / log_alpha
 
     def update(self, sparse_vectors: torch.Tensor) -> None:
         self.df_counts += (sparse_vectors.detach() > 0).sum(dim=0)
         self.doc_count += sparse_vectors.shape[0]
 
     def get_weights(self) -> torch.Tensor:
+        """DF-based importance weights: high-DF tokens get upweighted for penalization.
+
+        Uses normalized document frequency directly — tokens appearing in more
+        documents are penalized more heavily. Scale-invariant by construction.
+        """
         df_ratio = self.df_counts / max(self.doc_count, 1.0)
-        x_clamped = df_ratio.clamp(min=1e-8)
-        x_pow = x_clamped.pow(self._cached_log_alpha_2)
-        inner = (x_pow - 1.0).clamp(min=0.0)
-        return 1.0 / (1.0 + inner.pow(DF_BETA))
+        return df_ratio
 
     def get_stats(self) -> dict:
         df_ratio = self.df_counts / max(self.doc_count, 1.0)
@@ -42,27 +40,22 @@ class DocumentFrequencyTracker:
         self.doc_count *= DF_MOMENTUM
 
 
-class DFFlopsRegFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, activations: torch.Tensor, df_weights: torch.Tensor) -> torch.Tensor:
-        ctx.save_for_backward(activations, df_weights)
-        mean_act = activations.abs().mean(dim=0)
-        return (df_weights * mean_act ** 2).sum()
+def compute_df_flops_reg(activations: torch.Tensor, df_weights: torch.Tensor) -> torch.Tensor:
+    """Scale-invariant DF-FLOPS regularization via L1/L2 ratio.
 
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        activations, df_weights = ctx.saved_tensors
-        batch_size = activations.shape[0]
-        mean_act = activations.abs().mean(dim=0)
-        sign = torch.where(activations != 0, torch.sign(activations), torch.zeros_like(activations))
-        grad_activations = (
-            grad_output
-            * 2.0
-            * df_weights.unsqueeze(0)
-            * mean_act.unsqueeze(0)
-            * sign
-            / batch_size
-        )
-        return grad_activations, None
+    Uses the L1/L2 ratio of DF-weighted activations as a sparsity penalty.
+    This is scale-invariant (Rahimi et al., 2019): multiplying activations
+    by a constant does not change the penalty, eliminating the need for
+    manually tuned alpha/beta shape parameters.
 
-
+    The DF weighting ensures high-document-frequency tokens are penalized
+    more heavily, encouraging the model to use rare, discriminative tokens.
+    """
+    mean_act = activations.abs().mean(dim=0)
+    weighted = df_weights * mean_act
+    l1 = weighted.sum()
+    l2 = weighted.norm()
+    # L1/L2 ratio: 1.0 when uniform (dense), 1/sqrt(n) when one-hot (sparse)
+    # Minimizing this encourages sparsity. Normalized by sqrt(n) to [0, 1].
+    n = weighted.shape[0]
+    return l1 / (l2.clamp(min=1e-8) * n ** 0.5)

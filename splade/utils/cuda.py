@@ -31,4 +31,4 @@ torch.backends.cuda.enable_math_sdp(False)
 
 def unwrap_compiled(model: torch.nn.Module) -> torch.nn.Module:
     """Unwrap a torch.compile'd model to access the original module."""
-    return model._orig_mod
+    return getattr(model, "_orig_mod", model)

@@ -1,5 +1,5 @@
-experiment_name: "mechanistic_sst2"
-output_dir: "results/mechanistic/base"
+experiment_name: "cis_ablation"
+output_dir: "results/ablation"
 
 data:
   dataset_name: "sst2"
@@ -11,6 +11,3 @@ model:
 
 evaluation:
   seeds: [42]
-
-mechanistic:
-  circuit_fraction: 0.1

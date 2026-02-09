@@ -35,17 +35,17 @@ def train_sae_on_splade(
     model: torch.nn.Module,
     input_ids_list: list[torch.Tensor],
     attention_mask_list: list[torch.Tensor],
-    overcompleteness: int = 4,
-    l1_coeff: float = 1e-3,
-    lr: float = 1e-3,
-    epochs: int = 50,
-    batch_size: int = 64,
 ) -> SimpleSAE:
     """Train an SAE on BERT hidden states at the vocabulary projection layer.
 
     Collects hidden states from the model's vocab_transform output,
     then trains an overcomplete SAE to reconstruct them.
     """
+    overcompleteness = 4
+    l1_coeff = 1e-3
+    lr = 1e-3
+    epochs = 50
+    batch_size = 64
     _model = unwrap_compiled(model)
 
     # Collect hidden states (kept on GPU)

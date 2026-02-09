@@ -1,5 +1,5 @@
-experiment_name: "mechanistic_sst2"
-output_dir: "results/mechanistic/base"
+experiment_name: "sst2_distilbert"
+output_dir: "results/main/benchmark"
 
 data:
   dataset_name: "sst2"

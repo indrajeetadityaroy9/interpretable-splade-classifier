@@ -2,6 +2,7 @@ import torch
 import torch.nn
 from transformers import AutoConfig, AutoModel, AutoModelForMaskedLM
 
+from splade.circuits.core import CircuitState
 from splade.models.layers.activation import DReLU
 from splade.training.constants import CLASSIFIER_HIDDEN
 
@@ -96,11 +97,15 @@ class SpladeModel(torch.nn.Module):
         """ReLU MLP classifier returning only logits (for masked/patched evaluation)."""
         return self.classifier_fc2(torch.relu(self.classifier_fc1(sparse_vector)))
 
+    def classifier_parameters(self) -> list[torch.nn.Parameter]:
+        """Return classifier head parameters (for optimizer param groups)."""
+        return list(self.classifier_fc1.parameters()) + list(self.classifier_fc2.parameters())
+
     def _splade_head(
         self,
         hidden: torch.Tensor,
         attention_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> CircuitState:
         transformed = self.vocab_transform(hidden)
         transformed = torch.nn.functional.gelu(transformed)
         transformed = self.vocab_layer_norm(transformed)
@@ -113,18 +118,15 @@ class SpladeModel(torch.nn.Module):
             ~attention_mask.unsqueeze(-1).bool(), 0.0
         )
         sparse_vector = masked_activations.max(dim=1).values
-        assert sparse_vector.shape[-1] == self.padded_vocab_size, (
-            f"Sparse vector dim {sparse_vector.shape[-1]} != padded_vocab_size {self.padded_vocab_size}"
-        )
         logits, W_eff, b_eff = self.classifier_forward(sparse_vector)
 
-        return logits, sparse_vector, W_eff, b_eff
+        return CircuitState(logits, sparse_vector, W_eff, b_eff)
 
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> CircuitState:
         hidden = self.bert(
             input_ids=input_ids, attention_mask=attention_mask
         ).last_hidden_state
@@ -137,7 +139,7 @@ class SpladeModel(torch.nn.Module):
         self,
         embeddings: torch.Tensor,
         attention_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> CircuitState:
         hidden = self.bert(
             inputs_embeds=embeddings, attention_mask=attention_mask
         ).last_hidden_state

@@ -9,6 +9,7 @@ _DATASETS = {
     "ag_news": {"path": "ag_news", "name": None, "text_col": "text", "test_split": "test", "num_labels": 4},
     "imdb": {"path": "imdb", "name": None, "text_col": "text", "test_split": "test", "num_labels": 2},
     "yelp": {"path": "yelp_polarity", "name": None, "text_col": "text", "test_split": "test", "num_labels": 2},
+    "esnli": {"path": "esnli", "name": None, "text_cols": ["premise", "hypothesis"], "test_split": "test", "num_labels": 3},
 }
 
 
@@ -18,6 +19,8 @@ def _shuffle_and_truncate(
     combined = list(zip(texts, labels))
     random.Random(seed).shuffle(combined)
     shuffled_texts, shuffled_labels = zip(*combined)
+    if max_samples <= 0:
+        return list(shuffled_texts), list(shuffled_labels)
     return list(shuffled_texts)[:max_samples], list(shuffled_labels)[:max_samples]
 
 
@@ -31,7 +34,11 @@ def infer_max_length(texts: list[str], tokenizer) -> int:
 
 def _load_split(cfg: dict, split: str, max_samples: int, seed: int) -> tuple[list[str], list[int]]:
     dataset = load_dataset(cfg["path"], cfg["name"], split=split)
-    texts = list(dataset[cfg["text_col"]])
+    if "text_cols" in cfg:
+        cols = cfg["text_cols"]
+        texts = [f"{row[cols[0]]} [SEP] {row[cols[1]]}" for row in dataset]
+    else:
+        texts = list(dataset[cfg["text_col"]])
     labels = [int(label) for label in dataset["label"]]
     return _shuffle_and_truncate(texts, labels, max_samples, seed)
 

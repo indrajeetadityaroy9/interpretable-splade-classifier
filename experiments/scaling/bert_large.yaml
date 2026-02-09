@@ -11,4 +11,3 @@ model:
 
 evaluation:
   seeds: [42]
-  explainers: ["splade", "lime", "ig", "gradient_shap", "attention", "saliency", "deeplift", "random"]

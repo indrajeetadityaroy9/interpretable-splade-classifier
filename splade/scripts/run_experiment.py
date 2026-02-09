@@ -1,7 +1,8 @@
-"""CIS experiment pipeline: Train -> Evaluation -> Integration.
+"""CIS experiment pipeline: Train -> Mechanistic Evaluation.
 
-Three-phase pipeline producing a unified ExperimentResults artifact.
-All CIS mechanisms (DF-FLOPS, circuit losses, DLA, W_eff) are always active.
+Two-phase pipeline:
+  Phase 1: CIS Training (DF-FLOPS + circuit losses + GECO)
+  Phase 2: Mechanistic Evaluation (DLA verification, circuit extraction, completeness, separation)
 """
 
 import argparse
@@ -13,35 +14,24 @@ import yaml
 
 from splade.config.load import load_config
 from splade.config.schema import Config
-from splade.evaluation.benchmark import (ExperimentResults,
-                                         aggregate_results,
-                                         benchmark_explainer,
-                                         print_aggregated_results,
-                                         print_experiment_results)
-from splade.evaluation.explainers import EXPLAINER_REGISTRY
-from splade.evaluation.f_fidelity import finetune_surrogate_model
-from splade.evaluation.faithfulness import UnigramSampler
-from splade.evaluation.integration import analyze_circuit_faithfulness_alignment
 from splade.evaluation.mechanistic import (print_mechanistic_results,
                                            run_mechanistic_evaluation)
-from splade.inference import explain_model, explain_model_batch
-from splade.pipelines import (PredictorWrapper, prepare_mechanistic_inputs,
-                              setup_and_train)
-from splade.training.constants import FRAMEWORK_NAME
+from splade.pipelines import prepare_mechanistic_inputs, setup_and_train
 
 
 def _print_cis_config(config: Config) -> None:
     """Print CIS experiment configuration."""
-    print(f"\n--- {FRAMEWORK_NAME} ---")
+    train_str = "full" if config.data.train_samples <= 0 else str(config.data.train_samples)
+    test_str = "full" if config.data.test_samples <= 0 else str(config.data.test_samples)
+    print("\n--- Circuit-Integrated SPLADE (CIS) ---")
     print(f"  Model:       {config.model.name}")
-    print(f"  Dataset:     {config.data.dataset_name} (train={config.data.train_samples}, test={config.data.test_samples})")
+    print(f"  Dataset:     {config.data.dataset_name} (train={train_str}, test={test_str})")
     print(f"  Seeds:       {config.evaluation.seeds}")
-    print(f"  Explainers:  {config.evaluation.explainers}")
     print(f"  SAE compare: {'yes' if config.mechanistic.sae_comparison else 'no'}")
     print()
 
 
-def run_experiment(config: Config) -> list[ExperimentResults]:
+def run_experiment(config: Config) -> list[dict]:
     """Run the full CIS experiment pipeline across all seeds."""
     all_results = []
 
@@ -61,15 +51,8 @@ def run_experiment(config: Config) -> list[ExperimentResults]:
         exp = setup_and_train(config, seed)
         print(f"Accuracy: {exp.accuracy:.4f}")
 
-        eval_batch_size = min(exp.batch_size * 4, 128)
-        experiment = ExperimentResults(
-            config_snapshot=asdict(config),
-            seed=seed,
-            accuracy=exp.accuracy,
-        )
-
-        # Phase 2: Evaluation (Mechanistic + Faithfulness)
-        print("\n--- PHASE 2: EVALUATION ---")
+        # Phase 2: Mechanistic Evaluation
+        print("\n--- PHASE 2: MECHANISTIC EVALUATION ---")
 
         input_ids_list, attention_mask_list = prepare_mechanistic_inputs(
             exp.tokenizer, exp.test_texts, exp.max_length,
@@ -78,160 +61,54 @@ def run_experiment(config: Config) -> list[ExperimentResults]:
         mechanistic_results = run_mechanistic_evaluation(
             exp.model, input_ids_list, attention_mask_list,
             exp.test_labels, exp.tokenizer, num_classes=exp.num_labels,
-            circuit_threshold=config.mechanistic.circuit_threshold,
+            circuit_fraction=config.mechanistic.circuit_fraction,
             run_sae_comparison=config.mechanistic.sae_comparison,
             centroid_tracker=exp.centroid_tracker,
         )
 
-        experiment.dla_verification_error = mechanistic_results.dla_verification_error
-        experiment.circuits = mechanistic_results.circuits
-        experiment.circuit_completeness = mechanistic_results.circuit_completeness
-        experiment.semantic_fidelity = mechanistic_results.semantic_fidelity
-        experiment.sae_comparison = mechanistic_results.sae_comparison
-
         print_mechanistic_results(mechanistic_results)
 
-        mask_token = exp.tokenizer.mask_token
-        sampler = UnigramSampler(exp.test_texts, seed=seed)
-        predictor = PredictorWrapper(
-            exp.model, exp.tokenizer, exp.max_length, eval_batch_size,
-        )
+        result = {
+            "seed": seed,
+            "accuracy": exp.accuracy,
+            "dla_verification_error": mechanistic_results.dla_verification_error,
+            "semantic_fidelity": mechanistic_results.semantic_fidelity,
+            "eraser_metrics": mechanistic_results.eraser_metrics,
+            "explainer_comparison": mechanistic_results.explainer_comparison,
+            "layerwise_attribution": mechanistic_results.layerwise_attribution,
+            "sae_comparison": mechanistic_results.sae_comparison,
+            "circuit_completeness": {
+                str(k): v for k, v in mechanistic_results.circuit_completeness.items()
+            },
+            "circuits": {},
+        }
 
-        surrogate_model = finetune_surrogate_model(
-            exp.model, exp.tokenizer, exp.train_texts, exp.train_labels,
-            exp.max_length, seed=seed,
-        )
+        for class_idx, circuit in mechanistic_results.circuits.items():
+            result["circuits"][str(class_idx)] = {
+                "token_ids": circuit.token_ids,
+                "token_names": circuit.token_names,
+                "attribution_scores": circuit.attribution_scores,
+                "completeness_score": circuit.completeness_score,
+            }
 
-        attributions_per_explainer: dict[str, list[list[tuple[str, float]]]] = {}
-
-        for explainer_name in config.evaluation.explainers:
-            if explainer_name == "splade":
-                def splade_explain_fn(text, top_k):
-                    return explain_model(
-                        exp.model, exp.tokenizer, text, exp.max_length,
-                        top_k=top_k, input_only=True,
-                    )
-
-                def splade_batch_explain_fn(texts, top_k):
-                    return explain_model_batch(
-                        exp.model, exp.tokenizer, texts, exp.max_length,
-                        top_k=top_k, input_only=True, batch_size=eval_batch_size,
-                    )
-
-                explain_fn = splade_explain_fn
-                batch_explain_fn = splade_batch_explain_fn
-                display_name = "SPLADE"
-            else:
-                explainer_obj = EXPLAINER_REGISTRY[explainer_name](seed=seed)
-
-                def _make_explain(obj=explainer_obj):
-                    def fn(text, top_k):
-                        return obj.explain(exp.model, exp.tokenizer, text, exp.max_length, top_k)
-                    return fn
-
-                def _make_batch_explain(obj=explainer_obj):
-                    def fn(texts, top_k):
-                        return obj.explain_batch(exp.model, exp.tokenizer, texts, exp.max_length, top_k, batch_size=eval_batch_size)
-                    return fn
-
-                explain_fn = _make_explain()
-                batch_explain_fn = _make_batch_explain()
-                display_name = explainer_name.upper()
-
-            result, word_attributions = benchmark_explainer(
-                predictor, display_name, explain_fn, batch_explain_fn,
-                exp.test_texts, mask_token=mask_token, seed=seed,
-                sampler=sampler, tokenizer=exp.tokenizer, max_length=exp.max_length,
-                surrogate_model=surrogate_model, test_labels=exp.test_labels,
-            )
-            result.accuracy = exp.accuracy
-            experiment.explainer_results.append(result)
-            attributions_per_explainer[display_name] = word_attributions
-
-        # Phase 3: Integration Analysis
-        if mechanistic_results.circuits:
-            print("\n--- PHASE 3: CIRCUIT-FAITHFULNESS INTEGRATION ---")
-
-            experiment.circuit_faithfulness_alignment = analyze_circuit_faithfulness_alignment(
-                mechanistic_results.circuits,
-                experiment.explainer_results,
-                attributions_per_explainer,
-                exp.test_labels,
-            )
-
-        print_experiment_results(experiment)
-        all_results.append(experiment)
+        all_results.append(result)
 
     _save_results(config, all_results)
 
     return all_results
 
 
-def _save_results(config: Config, results: list[ExperimentResults]) -> None:
+def _save_results(config: Config, results: list[dict]) -> None:
     """Save experiment results to JSON."""
-    serializable = []
-    for r in results:
-        d = {
-            "seed": r.seed,
-            "accuracy": r.accuracy,
-            "dla_verification_error": r.dla_verification_error,
-            "semantic_fidelity": r.semantic_fidelity,
-            "sae_comparison": r.sae_comparison,
-            "circuit_faithfulness_alignment": r.circuit_faithfulness_alignment,
-        }
-        # Circuits: serialize VocabularyCircuit objects
-        circuits_ser = {}
-        for class_idx, circuit in r.circuits.items():
-            circuits_ser[str(class_idx)] = {
-                "token_ids": circuit.token_ids,
-                "token_names": circuit.token_names,
-                "attribution_scores": circuit.attribution_scores,
-                "completeness_score": circuit.completeness_score,
-            }
-        d["circuits"] = circuits_ser
-        d["circuit_completeness"] = {str(k): v for k, v in r.circuit_completeness.items()}
-
-        # Explainer results
-        d["explainer_results"] = []
-        for er in r.explainer_results:
-            er_dict = {
-                "name": er.name,
-                "accuracy": er.accuracy,
-                "soft_comprehensiveness": er.soft_comprehensiveness,
-                "soft_sufficiency": er.soft_sufficiency,
-                "causal_faithfulness": er.causal_faithfulness,
-                "monotonicity": er.monotonicity,
-                "f_fidelity_pos": er.f_fidelity_pos,
-                "f_fidelity_neg": er.f_fidelity_neg,
-                "adversarial_sensitivity": er.adversarial_sensitivity,
-                "inference_latency": er.inference_latency,
-                "filler_comprehensiveness": {str(k): v for k, v in er.filler_comprehensiveness.items()},
-                "eraser_comprehensiveness": {str(k): v for k, v in er.eraser_comprehensiveness.items()},
-                "eraser_sufficiency": {str(k): v for k, v in er.eraser_sufficiency.items()},
-                "aopc": {str(k): v for k, v in er.aopc.items()},
-                "naopc": {str(k): v for k, v in er.naopc.items()},
-            }
-            d["explainer_results"].append(er_dict)
-
-        serializable.append(d)
-
     output_path = os.path.join(config.output_dir, "experiment_results.json")
     with open(output_path, "w") as f:
-        json.dump(serializable, f, indent=2)
+        json.dump(results, f, indent=2)
     print(f"\nResults saved to {output_path}")
-
-    # Multi-seed aggregation
-    if len(results) > 1:
-        all_explainer_results = [r.explainer_results for r in results]
-        aggregated = aggregate_results(all_explainer_results)
-        print_aggregated_results(aggregated)
-        with open(os.path.join(config.output_dir, "metrics_aggregated.json"), "w") as f:
-            json.dump(aggregated, f, indent=2)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run CIS experiment: Train -> Evaluation -> Integration",
+        description="Run CIS experiment: Train -> Mechanistic Evaluation",
     )
     parser.add_argument("--config", type=str, required=True, help="Path to YAML config")
     args = parser.parse_args()

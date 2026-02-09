@@ -1,5 +1,5 @@
-experiment_name: "imdb_distilbert"
-output_dir: "results/datasets/imdb"
+experiment_name: "paper_imdb_ablation"
+output_dir: "results/paper/imdb_ablation"
 
 data:
   dataset_name: "imdb"
@@ -11,3 +11,6 @@ model:
 
 evaluation:
   seeds: [42]
+
+mechanistic:
+  circuit_fraction: 0.1

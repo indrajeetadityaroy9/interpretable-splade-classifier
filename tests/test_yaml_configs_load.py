@@ -14,4 +14,4 @@ def get_experiment_yamls():
 def test_experiment_yaml_loads(yaml_path):
     config = load_config(yaml_path)
     assert config.experiment_name is not None
-    assert config.data.train_samples > 0
+    assert config.data.train_samples > 0 or config.data.train_samples == -1

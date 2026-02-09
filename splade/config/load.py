@@ -12,8 +12,8 @@ def load_config(path: str) -> Config:
     eval_kwargs = {}
     if "seeds" in eval_raw:
         eval_kwargs["seeds"] = eval_raw["seeds"]
-    if "explainers" in eval_raw:
-        eval_kwargs["explainers"] = eval_raw["explainers"]
+    # Drop legacy key that no longer exists in EvaluationConfig
+    eval_raw.pop("explainers", None)
 
     mech_raw = raw_config.get("mechanistic", {})
     # Drop legacy keys that no longer exist in MechanisticConfig

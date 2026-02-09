@@ -6,8 +6,7 @@ import numpy as np
 import torch
 from transformers import AutoConfig
 
-from splade.training.constants import (AGC_CLIP_FACTOR, AGC_EPS,
-                                       LR_FIND_DIVERGE_FACTOR, LR_FIND_END,
+from splade.training.constants import (LR_FIND_DIVERGE_FACTOR, LR_FIND_END,
                                        LR_FIND_STEPS, WEIGHT_DECAY)
 from splade.utils.cuda import COMPUTE_DTYPE, DEVICE, unwrap_compiled
 
@@ -107,10 +106,19 @@ def _build_param_groups(model: torch.nn.Module, base_lr: float) -> list[dict]:
     ]
 
 
-def _adaptive_gradient_clip(
+def _gradient_centralization(
     model: torch.nn.Module,
     skip_params: set | None = None,
 ) -> None:
+    """Parameter-free gradient conditioning via centralization.
+
+    Subtracts the mean from each gradient tensor (for weight matrices only),
+    constraining gradients to the hyperplane of zero-mean vectors. This
+    improves the Lipschitz smoothness of the loss landscape without any
+    tunable hyperparameters.
+
+    Reference: Yong et al., "Gradient Centralization" (arXiv:2004.01461).
+    """
     skip_ids = frozenset(id(p) for p in skip_params) if skip_params else frozenset()
     for parameter in model.parameters():
         if parameter.grad is None:
@@ -118,23 +126,11 @@ def _adaptive_gradient_clip(
         if id(parameter) in skip_ids:
             continue
         if parameter.data.ndim >= 2:
-            p_flat = parameter.data.reshape(parameter.data.shape[0], -1)
-            g_flat = parameter.grad.data.reshape(parameter.grad.data.shape[0], -1)
-            p_norms = p_flat.norm(2, dim=1)
-            g_norms = g_flat.norm(2, dim=1)
-            max_norms = torch.clamp(p_norms, min=AGC_EPS) * AGC_CLIP_FACTOR
-            clip_mask = g_norms > max_norms
-            if clip_mask.any():
-                scale = max_norms / (g_norms + 1e-8)
-                scale = torch.where(clip_mask, scale, torch.ones_like(scale))
-                parameter.grad.data.mul_(
-                    scale.view(parameter.data.shape[0], *([1] * (parameter.data.ndim - 1)))
-                )
-        else:
-            p_norm = parameter.data.norm(2)
-            g_norm = parameter.grad.data.norm(2)
-            max_norm = torch.clamp(p_norm, min=AGC_EPS) * AGC_CLIP_FACTOR
-            parameter.grad.data.mul_(torch.clamp(max_norm / (g_norm + 1e-8), max=1.0))
+            # Centralize: subtract mean across all dims except the output dim
+            parameter.grad.data -= parameter.grad.data.mean(
+                dim=tuple(range(1, parameter.grad.data.ndim)),
+                keepdim=True,
+            )
 
 
 class _LRScheduler:
@@ -152,5 +148,3 @@ class _LRScheduler:
             return self.base_lr * (current_step / max(self.warmup_steps, 1))
         progress = (current_step - self.warmup_steps) / max(self.total_steps - self.warmup_steps, 1)
         return self.base_lr * 0.5 * (1 + math.cos(math.pi * progress))
-
-

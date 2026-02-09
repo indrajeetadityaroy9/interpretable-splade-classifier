@@ -1,0 +1,16 @@
+experiment_name: "verification_full"
+output_dir: "results/verification_full"
+
+data:
+  dataset_name: "sst2"
+  train_samples: 1000
+  test_samples: 100
+
+model:
+  name: "distilbert-base-uncased"
+
+evaluation:
+  seeds: [42]
+
+mechanistic:
+  circuit_fraction: 0.1

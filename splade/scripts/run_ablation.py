@@ -1,10 +1,15 @@
-"""CIS ablation study: Full CIS vs DF-FLOPS only vs Baseline.
+"""CIS ablation study: Baseline vs Full CIS.
 
-Ablation variants are created by temporarily zeroing CIS constants,
-not by config flags. All three variants train from scratch.
+Two-variant ablation to demonstrate that circuit training losses
+produce measurably better circuits than baseline:
+
+  1. Baseline:  No circuit losses (CIRCUIT_WARMUP_FRACTION=1.1)
+  2. Full CIS:  All circuit losses active with uncertainty weighting
 """
 
 import argparse
+import json
+import os
 from unittest.mock import patch
 
 from splade.config.load import load_config
@@ -28,10 +33,24 @@ def _run_variant(config, seed, name):
     results = run_mechanistic_evaluation(
         exp.model, input_ids_list, attention_mask_list,
         exp.test_labels, exp.tokenizer, num_classes=exp.num_labels,
+        centroid_tracker=exp.centroid_tracker,
     )
+
+    completeness_vals = list(results.circuit_completeness.values())
+    sf = results.semantic_fidelity
+    metrics = {
+        "accuracy": exp.accuracy,
+        "dla_error": results.dla_verification_error,
+        "completeness_mean": sum(completeness_vals) / len(completeness_vals) if completeness_vals else 0.0,
+        "cosine_separation": sf.get("cosine_separation"),  # None when centroids uninitialized
+        "jaccard_separation": sf.get("class_separation", 0.0),
+    }
+
     print(f"\n--- {name} Results ---")
     print(f"  Accuracy: {exp.accuracy:.4f}")
     print_mechanistic_results(results)
+
+    return metrics
 
 
 def main() -> None:
@@ -42,16 +61,35 @@ def main() -> None:
     config = load_config(args.config)
     seed = config.evaluation.seeds[0]
 
-    # Variant 1: Baseline — zero all circuit lambdas
-    # (DF-FLOPS is always active via SatLambdaSchedule, not a patchable constant,
-    #  so "Baseline" and "DF-FLOPS only" are equivalent)
-    with patch.object(constants, "CIRCUIT_COMPLETENESS_LAMBDA", 0.0), \
-         patch.object(constants, "CIRCUIT_SEPARATION_LAMBDA", 0.0), \
-         patch.object(constants, "CIRCUIT_SHARPNESS_LAMBDA", 0.0):
-        _run_variant(config, seed, "Baseline (no circuit losses)")
+    print(f"\nAblation: {config.data.dataset_name}, {config.data.train_samples} train, "
+          f"{config.data.test_samples} test, seed={seed}")
 
-    # Variant 2: Full CIS — default constants
-    _run_variant(config, seed, "Full CIS")
+    # Variant 1: Baseline — no circuit losses
+    with patch.object(constants, "CIRCUIT_WARMUP_FRACTION", 1.1):
+        baseline = _run_variant(config, seed, "Baseline (no circuit losses)")
+
+    # Variant 2: Full CIS — all circuit losses with uncertainty weighting
+    full_cis = _run_variant(config, seed, "Full CIS")
+
+    # Comparison table
+    print(f"\n{'='*80}")
+    print("ABLATION COMPARISON")
+    print(f"{'='*80}")
+    header = f"{'Variant':<30} {'Accuracy':>10} {'DLA Err':>10} {'Complete':>10} {'Cos Sep':>10} {'Jac Sep':>10}"
+    print(header)
+    print("-" * 80)
+    for name, m in [("Baseline", baseline), ("Full CIS", full_cis)]:
+        cos_str = f"{m['cosine_separation']:>10.4f}" if m['cosine_separation'] is not None else f"{'N/A':>10}"
+        print(f"{name:<30} {m['accuracy']:>10.4f} {m['dla_error']:>10.6f} "
+              f"{m['completeness_mean']:>10.4f} {cos_str} {m['jaccard_separation']:>10.4f}")
+    print(f"{'='*80}")
+
+    # Save
+    os.makedirs(config.output_dir, exist_ok=True)
+    output_path = os.path.join(config.output_dir, "ablation_results.json")
+    with open(output_path, "w") as f:
+        json.dump({"baseline": baseline, "full_cis": full_cis}, f, indent=2)
+    print(f"\nResults saved to {output_path}")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,13 @@
+experiment_name: "verification_ablation"
+output_dir: "results/verification_ablation"
+
+data:
+  dataset_name: "sst2"
+  train_samples: 200
+  test_samples: 50
+
+model:
+  name: "distilbert-base-uncased"
+
+evaluation:
+  seeds: [42]

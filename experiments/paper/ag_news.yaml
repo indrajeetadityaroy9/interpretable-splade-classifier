@@ -1,5 +1,5 @@
-experiment_name: "ag_news_distilbert"
-output_dir: "results/datasets/ag_news"
+experiment_name: "paper_ag_news"
+output_dir: "results/paper/ag_news"
 
 data:
   dataset_name: "ag_news"
@@ -11,3 +11,6 @@ model:
 
 evaluation:
   seeds: [42]
+
+mechanistic:
+  circuit_fraction: 0.1

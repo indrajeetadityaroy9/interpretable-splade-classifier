@@ -1,0 +1,16 @@
+experiment_name: "cis_multi_dataset"
+output_dir: "results/paper/multi_dataset"
+
+data:
+  dataset_name: "sst2"
+  train_samples: -1   # full splits per dataset
+  test_samples: -1
+
+model:
+  name: "distilbert-base-uncased"
+
+evaluation:
+  seeds: [42]
+
+mechanistic:
+  circuit_fraction: 0.1

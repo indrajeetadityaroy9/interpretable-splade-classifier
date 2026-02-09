@@ -7,31 +7,26 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 
 from splade.data.loader import infer_max_length
-from splade.training.circuit_losses import (
+from splade.circuits.geco import GECOController
+from splade.circuits.losses import (
     AttributionCentroidTracker,
-    CircuitLossSchedule,
-    compute_attribution_sharpness_loss,
-    compute_circuit_completeness_loss,
-    compute_circuit_separation_loss,
+    UncertaintyWeighting,
+    compute_completeness_loss,
+    compute_separation_loss,
+    compute_sharpness_loss,
 )
+from splade.training import constants as _C
 from splade.training.constants import (
-    CIRCUIT_COMPLETENESS_LAMBDA,
-    CIRCUIT_FRACTION,
-    CIRCUIT_SEPARATION_LAMBDA,
-    CIRCUIT_SHARPNESS_LAMBDA,
-    CIRCUIT_TEMPERATURE,
-    CIRCUIT_WARMUP_FRACTION,
     EARLY_STOP_PATIENCE,
     EMA_DECAY,
     LABEL_SMOOTHING,
     MAX_EPOCHS,
     WARMUP_RATIO,
 )
-from splade.training.losses import DFFlopsRegFunction, DocumentFrequencyTracker
-from splade.training.optim import (_adaptive_gradient_clip,
+from splade.training.losses import DocumentFrequencyTracker, compute_df_flops_reg
+from splade.training.optim import (_gradient_centralization,
                                    _build_param_groups,
                                    _infer_batch_size, _LRScheduler, find_lr)
-from splade.training.scheduler.lambda_sched import SatLambdaSchedule
 from splade.utils.cuda import COMPUTE_DTYPE, DEVICE, unwrap_compiled
 
 _NUM_WORKERS = min(os.cpu_count() or 4, 8)
@@ -117,7 +112,16 @@ def train_model(
     optimal_lr = find_lr(model, loader, num_labels)
     print(f"LR range test -> optimal_lr={optimal_lr:.2e}")
 
+    # Uncertainty weighting: 3 learnable log-variance params for circuit losses
+    uncertainty_weighting = UncertaintyWeighting(num_tasks=3)
+
     param_groups = _build_param_groups(model, optimal_lr)
+    # Add uncertainty weighting params to optimizer (same LR, no decay)
+    param_groups.append({
+        "params": list(uncertainty_weighting.parameters()),
+        "lr": optimal_lr,
+        "weight_decay": 0.0,
+    })
     optimizer = torch.optim.AdamW(param_groups, fused=True)
 
     steps_per_epoch = -(-len(texts) // batch_size)
@@ -125,17 +129,11 @@ def train_model(
     warmup_steps = max(1, int(WARMUP_RATIO * total_steps))
 
     lr_scheduler = _LRScheduler(optimal_lr, total_steps, warmup_steps)
-    lambda_schedule = SatLambdaSchedule(
-        warmup_steps=warmup_steps,
-        total_steps=total_steps,
-    )
 
     _orig = unwrap_compiled(model)
     vocab_size = _orig.padded_vocab_size
     df_tracker = DocumentFrequencyTracker(vocab_size=vocab_size)
-    classifier_params = set(
-        list(_orig.classifier_fc1.parameters()) + list(_orig.classifier_fc2.parameters())
-    )
+    classifier_params = set(_orig.classifier_parameters())
 
     criterion = (
         torch.nn.BCEWithLogitsLoss()
@@ -145,13 +143,19 @@ def train_model(
 
     ema = ModelEMA(model, decay=EMA_DECAY)
 
-    # CIS circuit losses — always active
+    # CIS circuit losses with GECO adaptive weighting
     centroid_tracker = AttributionCentroidTracker(
         num_classes=num_labels, vocab_size=vocab_size,
     )
-    circuit_schedule = CircuitLossSchedule(
-        total_steps=total_steps, warmup_fraction=CIRCUIT_WARMUP_FRACTION,
-    )
+    geco = GECOController(steps_per_epoch=steps_per_epoch)
+    circuit_delay_steps = int(_C.CIRCUIT_WARMUP_FRACTION * total_steps)
+    # Patience reset at 20% of total steps regardless of whether circuits activate.
+    # This ensures ablation baseline and full CIS have identical training horizons.
+    _PATIENCE_RESET_FRACTION = 0.2
+    patience_reset_step = int(_PATIENCE_RESET_FRACTION * total_steps)
+    patience_was_reset = False
+    global_step = 0
+    warmup_finalized = False
 
     val_encoding = tokenizer(
         val_texts,
@@ -197,30 +201,38 @@ def train_model(
                 )
 
                 df_tracker.update(sparse)
-                df_weights = df_tracker.get_weights()
-                regularization_loss = DFFlopsRegFunction.apply(sparse, df_weights)
+                df_loss = compute_df_flops_reg(sparse, df_tracker.get_weights())
 
-                regularization_weight = lambda_schedule.compute_lambda(sparse)
-                loss = classification_loss + regularization_weight * regularization_loss
+                global_step += 1
 
-                # CIS circuit losses
-                circuit_weight = circuit_schedule.step()
-                if circuit_weight > 0:
-                    cc_loss = compute_circuit_completeness_loss(
+                # Reset patience at fixed point for both baseline and CIS
+                if not patience_was_reset and global_step >= patience_reset_step:
+                    patience_was_reset = True
+                    patience_counter = 0
+
+                if global_step < circuit_delay_steps:
+                    # Warmup: CE + DF-FLOPS only, record CE for GECO tau
+                    loss = classification_loss + df_loss
+                    geco.record_warmup_ce(classification_loss.detach().item())
+                else:
+                    if not warmup_finalized:
+                        tau = geco.finalize_warmup()
+                        print(f"GECO: tau_ce={tau:.4f}")
+                        warmup_finalized = True
+
+                    cc_loss = compute_completeness_loss(
                         sparse, W_eff, batch_labels.view(-1),
                         _orig.classifier_logits_only,
-                        CIRCUIT_FRACTION, CIRCUIT_TEMPERATURE,
                     )
-                    sep_loss = compute_circuit_separation_loss(centroid_tracker)
-                    sharp_loss = compute_attribution_sharpness_loss(
+                    sep_loss = compute_separation_loss(centroid_tracker)
+                    sharp_loss = compute_sharpness_loss(
                         sparse, W_eff, batch_labels.view(-1),
                     )
-                    circuit_loss = circuit_weight * (
-                        CIRCUIT_COMPLETENESS_LAMBDA * cc_loss
-                        + CIRCUIT_SEPARATION_LAMBDA * sep_loss
-                        + CIRCUIT_SHARPNESS_LAMBDA * sharp_loss
-                    )
-                    loss = loss + circuit_loss
+
+                    # Uncertainty weighting: learnable σ² per loss
+                    weighted_circuit_loss = uncertainty_weighting(cc_loss, sep_loss, sharp_loss)
+                    circuit_objective = weighted_circuit_loss + df_loss
+                    loss = geco.compute_loss(classification_loss, circuit_objective)
 
                     centroid_tracker.update(
                         sparse.detach(), W_eff.detach(),
@@ -228,7 +240,7 @@ def train_model(
                     )
 
             loss.backward()
-            _adaptive_gradient_clip(model, skip_params=classifier_params)
+            _gradient_centralization(model, skip_params=classifier_params)
             optimizer.step()
 
             ema.update(model)
@@ -237,15 +249,15 @@ def train_model(
             batch_count += 1
 
         average_loss = total_loss.item() / batch_count
-        lambda_schedule.sync_sparsity()
-        sparsity = lambda_schedule._current_sparsity
-        epoch_msg = f"Epoch {epoch_index + 1}: Loss = {average_loss:.4f}, Sparsity: {sparsity:.2%}"
+        epoch_msg = f"Epoch {epoch_index + 1}: Loss = {average_loss:.4f}"
 
         stats = df_tracker.get_stats()
         epoch_msg += f", Top-1 DF: {stats['top1_df_pct']:.1f}%"
 
-        active = circuit_schedule._step >= circuit_schedule.delay_steps
-        epoch_msg += f", Circuit: {'active' if active else 'warming up'}"
+        if warmup_finalized:
+            epoch_msg += f", GECO lambda={geco.lambda_ce:.4f}"
+        else:
+            epoch_msg += ", GECO: warming up"
 
         ema.apply_shadow(model)
         model.eval()

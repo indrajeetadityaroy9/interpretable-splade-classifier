@@ -3,12 +3,11 @@ output_dir: "results/datasets/yelp"
 
 data:
   dataset_name: "yelp"
-  train_samples: 2000
-  test_samples: 200
+  train_samples: -1  # full split: 560,000
+  test_samples: -1   # full split: 38,000
 
 model:
   name: "distilbert-base-uncased"
 
 evaluation:
   seeds: [42]
-  explainers: ["splade", "lime", "ig", "gradient_shap", "attention", "saliency", "deeplift", "random"]

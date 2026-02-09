@@ -1,38 +1,23 @@
-FRAMEWORK_NAME = "Circuit-Integrated SPLADE (CIS)"
-
-# Classifier MLP
+# Classifier MLP (architecture, not hyperparameter)
 CLASSIFIER_HIDDEN = 256
 
-# DF-FLOPS (always active)
-DF_ALPHA = 0.1
-DF_BETA = 5.0
+# DF-FLOPS: epoch-level soft reset retention
 DF_MOMENTUM = 0.9
 
-AGC_CLIP_FACTOR = 0.01
-AGC_EPS = 1e-3
-
-LAMBDA_FINAL = 1e-3
-
-MAX_EPOCHS = 20
-EARLY_STOP_PATIENCE = 5
-
+# Training loop ceilings and standard regularization
+MAX_EPOCHS = 50
+EARLY_STOP_PATIENCE = 10
 WARMUP_RATIO = 0.06
-
 WEIGHT_DECAY = 0.01
-
 LABEL_SMOOTHING = 0.1
-
 EMA_DECAY = 0.999
 
-LR_FIND_STEPS = 200
+# LR range test (already adaptive)
+LR_FIND_STEPS = 100
 LR_FIND_END = 1e-2
 LR_FIND_DIVERGE_FACTOR = 4.0
 
 # CIS circuit losses (always active)
-CIRCUIT_COMPLETENESS_LAMBDA = 0.1
-CIRCUIT_SEPARATION_LAMBDA = 0.05
-CIRCUIT_SHARPNESS_LAMBDA = 0.01
-CIRCUIT_WARMUP_FRACTION = 0.3
+CIRCUIT_WARMUP_FRACTION = 0.2
 CIRCUIT_FRACTION = 0.1
 CIRCUIT_TEMPERATURE = 10.0
-CENTROID_MOMENTUM = 0.99
