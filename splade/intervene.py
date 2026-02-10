@@ -103,7 +103,7 @@ def suppress_token_globally(model: nn.Module, token_id: int) -> None:
 
     Mathematical guarantee: If the output projection weight[token_id, :] = 0
     and bias[token_id] = 0, then the MLM logit for this token is always 0,
-    so after DReLU (which has threshold >= 0), s[token_id] = 0 for all inputs.
+    so after GatedJumpReLU (gate_threshold >> 0), s[token_id] = 0 for all inputs.
     """
     _model = unwrap_compiled(model)
     output_emb = _model.backbone.get_output_embeddings()
@@ -111,7 +111,7 @@ def suppress_token_globally(model: nn.Module, token_id: int) -> None:
         output_emb.weight[token_id, :] = 0
         if output_emb.bias is not None:
             output_emb.bias[token_id] = 0
-        _model.activation.theta[token_id] = 1e6  # ensure DReLU blocks it
+        _model.activation.gate_threshold.data[token_id] = 1e6  # ensure gate blocks it
 
 
 def suppress_tokens_by_name(
@@ -154,10 +154,10 @@ class SuppressedModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Returns [B, L, V] sparse sequence with suppressed tokens zeroed."""
-        sparse_seq = self.model(input_ids, attention_mask)
-        return sparse_seq * self.keep_mask
+        sparse_seq, gate_probs = self.model(input_ids, attention_mask)
+        return sparse_seq * self.keep_mask, gate_probs
 
     def classify(
         self,

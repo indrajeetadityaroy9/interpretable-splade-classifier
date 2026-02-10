@@ -14,6 +14,7 @@ import yaml
 
 from splade.config.load import load_config
 from splade.data.loader import load_civilcomments_with_identity
+from splade.evaluation.leace import LEACEWrappedModel, fit_leace_eraser
 from splade.inference import score_model
 from splade.intervene import (
     SuppressedModel,
@@ -112,14 +113,42 @@ def main() -> None:
     for name, metrics in sorted(bias_after["per_identity"].items(), key=lambda x: -abs(x[1]["fpr_gap"])):
         print(f"  {name:<35} FPR={metrics['fpr']:.4f}  gap={metrics['fpr_gap']:+.4f}  n={metrics['count']}")
 
+    # LEACE baseline: concept erasure via covariance-based projection
+    print("\n--- LEACE concept erasure baseline ---")
+    train_texts_leace, train_labels_leace, _, _, _, _, _ = load_civilcomments_with_identity(
+        train_samples=config.data.train_samples,
+        test_samples=0,
+        seed=config.evaluation.seeds[0],
+    )
+    eraser = fit_leace_eraser(
+        exp.model, exp.tokenizer, train_texts_leace, train_labels_leace,
+        exp.max_length, batch_size=exp.batch_size,
+    )
+    leace_model = LEACEWrappedModel(exp.model, eraser)
+
+    print("\n--- Bias evaluation with LEACE ---")
+    bias_leace = evaluate_bias(
+        leace_model, exp.tokenizer, test_texts, test_labels,
+        test_identities, exp.max_length, batch_size=exp.batch_size,
+    )
+    print(f"Overall accuracy: {bias_leace['overall_accuracy']:.4f}")
+    print(f"Overall FPR: {bias_leace['overall_fpr']:.4f}")
+    for name, metrics in sorted(bias_leace["per_identity"].items(), key=lambda x: -abs(x[1]["fpr_gap"])):
+        print(f"  {name:<35} FPR={metrics['fpr']:.4f}  gap={metrics['fpr_gap']:+.4f}  n={metrics['count']}")
+
     # Summary
     acc_drop = bias_before["overall_accuracy"] - bias_after["overall_accuracy"]
     max_gap_before = max(abs(m["fpr_gap"]) for m in bias_before["per_identity"].values()) if bias_before["per_identity"] else 0
     max_gap_after = max(abs(m["fpr_gap"]) for m in bias_after["per_identity"].values()) if bias_after["per_identity"] else 0
+    max_gap_leace = max(abs(m["fpr_gap"]) for m in bias_leace["per_identity"].values()) if bias_leace["per_identity"] else 0
+    acc_drop_leace = bias_before["overall_accuracy"] - bias_leace["overall_accuracy"]
 
     print(f"\n--- Summary ---")
-    print(f"Accuracy drop: {acc_drop:+.4f}")
-    print(f"Max FPR gap: {max_gap_before:.4f} -> {max_gap_after:.4f}")
+    print(f"{'Method':<25} {'Acc Drop':>10} {'Max FPR Gap':>12}")
+    print("-" * 47)
+    print(f"{'Before':<25} {'—':>10} {max_gap_before:>12.4f}")
+    print(f"{'Surgical suppression':<25} {acc_drop:>+10.4f} {max_gap_after:>12.4f}")
+    print(f"{'LEACE erasure':<25} {acc_drop_leace:>+10.4f} {max_gap_leace:>12.4f}")
     print(f"Tokens suppressed: {len(token_ids)}")
 
     results = {
@@ -129,6 +158,7 @@ def main() -> None:
         "tokens_suppressed": tokens_to_suppress,
         "bias_before": bias_before,
         "bias_after": bias_after,
+        "bias_leace": bias_leace,
     }
 
     output_path = os.path.join(config.output_dir, "surgery_results.json")

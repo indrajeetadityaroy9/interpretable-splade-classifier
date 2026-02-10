@@ -128,3 +128,8 @@ def compute_sharpness_loss(
     l2 = attr.norm(dim=-1)
     hoyer = (sqrt_n - l1 / l2.clamp(min=1e-8)) / (sqrt_n - 1.0)
     return (1.0 - hoyer).mean()
+
+
+def compute_gate_sparsity_loss(gate_probs: torch.Tensor) -> torch.Tensor:
+    """L1 on gate open probabilities — L0 proxy encouraging sparsity."""
+    return gate_probs.mean()

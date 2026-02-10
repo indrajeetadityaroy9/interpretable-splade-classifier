@@ -46,7 +46,7 @@ def find_lr(
 
         temp_optimizer.zero_grad(set_to_none=True)
         with torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
-            sparse_seq = model(batch_ids, batch_mask)
+            sparse_seq, _ = model(batch_ids, batch_mask)
             logits = _orig.classify(sparse_seq, batch_mask).logits
             loss = (
                 criterion(logits.squeeze(-1), batch_labels)

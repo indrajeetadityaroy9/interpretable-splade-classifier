@@ -116,7 +116,7 @@ def run_sequence_mechanistic_evaluation(
         batch_labels = token_labels[start:end].to(DEVICE)
 
         with torch.inference_mode(), torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
-            sparse_seq = _model(batch_ids, batch_mask)
+            sparse_seq, _ = _model(batch_ids, batch_mask)
             token_logits = _model.tag(sparse_seq)
 
         # Token accuracy

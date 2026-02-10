@@ -34,7 +34,7 @@ def _run_inference_loop(
         for batch_ids, batch_mask in loader:
             batch_ids = batch_ids.to(DEVICE, non_blocking=True)
             batch_mask = batch_mask.to(DEVICE, non_blocking=True)
-            sparse_seq = model(batch_ids, batch_mask)
+            sparse_seq, _ = model(batch_ids, batch_mask)
             logits, sparse, w_eff, _ = _orig.classify(sparse_seq, batch_mask)
             all_logits.append(logits.clone())
             if extract_sparse:

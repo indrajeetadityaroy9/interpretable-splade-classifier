@@ -17,12 +17,12 @@ from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
 from splade.circuits.geco import GECOController
+from splade.circuits.losses import compute_gate_sparsity_loss
 from splade.circuits.sequence_losses import (
     TokenAttributionCentroidTracker,
     _gather_valid_positions,
     compute_token_completeness_loss,
     compute_token_separation_loss,
-    compute_token_sharpness_loss,
 )
 from splade.data.ner_loader import IGNORE_INDEX
 from splade.training.constants import (
@@ -81,7 +81,7 @@ def _find_lr_ner(
 
         temp_optimizer.zero_grad(set_to_none=True)
         with torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
-            sparse_seq = model(batch_ids, batch_mask)
+            sparse_seq, _ = model(batch_ids, batch_mask)
             token_logits = _orig.tag(sparse_seq)
             # token_logits: [B, L, C] -> [B*L, C]
             B, L, C = token_logits.shape
@@ -243,7 +243,7 @@ def train_sequence_model(
                 optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
-                sparse_seq = model(batch_ids, batch_mask)
+                sparse_seq, gate_probs = model(batch_ids, batch_mask)
                 token_logits = _orig.tag(sparse_seq)
                 # Token-level CE with ignore_index=-100
                 B, L, C = token_logits.shape
@@ -308,12 +308,10 @@ def train_sequence_model(
                             circuit_fraction=sparsity_target,
                         )
                         sep_loss = compute_token_separation_loss(centroid_tracker)
-                        sharp_loss = compute_token_sharpness_loss(
-                            sparse_flat, W_eff, labels_flat,
-                        )
+                        gate_loss = compute_gate_sparsity_loss(gate_probs)
 
-                        _SPARSITY_GAIN = 10.0
-                        circuit_objective = cc_loss + sep_loss + _SPARSITY_GAIN * sharp_loss
+                        _SPARSITY_GAIN = 1.0
+                        circuit_objective = cc_loss + sep_loss + _SPARSITY_GAIN * gate_loss
                         active_dims_ratio = batch_active / max(1.0, target_active_dims)
                         loss = geco.compute_loss_sparsity_aware(
                             classification_loss, circuit_objective, active_dims_ratio,
@@ -365,7 +363,7 @@ def train_sequence_model(
         model.eval()
         with torch.inference_mode():
             with torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
-                val_sparse_seq = model(val_ids_gpu, val_mask_gpu)
+                val_sparse_seq, _ = model(val_ids_gpu, val_mask_gpu)
                 val_token_logits = _orig.tag(val_sparse_seq)
                 B_v, L_v, C_v = val_token_logits.shape
                 val_logits_flat = val_token_logits.view(B_v * L_v, C_v)

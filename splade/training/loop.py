@@ -11,8 +11,8 @@ from splade.circuits.geco import GECOController
 from splade.circuits.losses import (
     AttributionCentroidTracker,
     compute_completeness_loss,
+    compute_gate_sparsity_loss,
     compute_separation_loss,
-    compute_sharpness_loss,
 )
 from splade.training.constants import (
     EARLY_STOP_PATIENCE,
@@ -181,7 +181,7 @@ def train_model(
             optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
-                sparse_seq = model(batch_ids, batch_mask)
+                sparse_seq, gate_probs = model(batch_ids, batch_mask)
                 logits, sparse, W_eff, _ = _orig.classify(sparse_seq, batch_mask)
                 classification_loss = (
                     criterion(logits.squeeze(-1), batch_labels)
@@ -216,11 +216,9 @@ def train_model(
                         circuit_fraction=sparsity_target,
                     )
                     sep_loss = compute_separation_loss(centroid_tracker)
-                    sharp_loss = compute_sharpness_loss(
-                        sparse, W_eff, batch_labels.view(-1),
-                    )
+                    gate_loss = compute_gate_sparsity_loss(gate_probs)
 
-                    circuit_objective = cc_loss + sep_loss + sharp_loss
+                    circuit_objective = cc_loss + sep_loss + gate_loss
                     loss = geco.compute_loss(classification_loss, circuit_objective)
 
                     centroid_tracker.update(
@@ -256,7 +254,7 @@ def train_model(
         model.eval()
         with torch.inference_mode():
             with torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
-                val_sparse_seq = model(val_ids_gpu, val_mask_gpu)
+                val_sparse_seq, _ = model(val_ids_gpu, val_mask_gpu)
                 val_logits = _orig.classify(val_sparse_seq, val_mask_gpu).logits
                 val_loss = (
                     criterion(val_logits.squeeze(-1), val_label_gpu)

@@ -56,7 +56,7 @@ def extract_vocabulary_circuit(
             bs = end - start
 
             with torch.inference_mode(), torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
-                sparse_seq = _model(batch_ids, batch_mask)
+                sparse_seq, _ = _model(batch_ids, batch_mask)
                 _, sparse_vector, W_eff, _ = _model.classify(sparse_seq, batch_mask)
 
             class_labels_t = torch.full((bs,), class_idx, device=DEVICE)
@@ -137,7 +137,7 @@ def measure_circuit_completeness(
         batch_labels_t = torch.tensor(class_labels[start:end], device=DEVICE)
 
         with torch.inference_mode(), torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
-            sparse_seq = _model(batch_ids, batch_mask)
+            sparse_seq, _ = _model(batch_ids, batch_mask)
             original_sparse = _model.to_pooled(sparse_seq, batch_mask)
             patched_sparse = original_sparse.clone()
             patched_sparse[:, non_circuit_ids_t] = 0.0
@@ -189,7 +189,7 @@ def measure_separation_jaccard(
         batch_labels_t = torch.tensor(batch_labels_slice, device=DEVICE)
 
         with torch.inference_mode(), torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
-            sparse_seq = _model(batch_ids, batch_mask)
+            sparse_seq, _ = _model(batch_ids, batch_mask)
             _, sparse_vector, W_eff, _ = _model.classify(sparse_seq, batch_mask)
 
         attr = compute_attribution_tensor(sparse_vector, W_eff, batch_labels_t)

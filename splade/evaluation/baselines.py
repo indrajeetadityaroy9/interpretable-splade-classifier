@@ -30,7 +30,7 @@ def dla_attribution(
     """
     _model = unwrap_compiled(model)
     with torch.inference_mode(), torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
-        sparse_seq = _model(input_ids, attention_mask)
+        sparse_seq, _ = _model(input_ids, attention_mask)
         _, sparse_vector, W_eff, _ = _model.classify(sparse_seq, attention_mask)
     return compute_attribution_tensor(sparse_vector, W_eff, target_classes).float()
 
@@ -51,7 +51,7 @@ def gradient_attribution(
     _model = unwrap_compiled(model)
 
     with torch.no_grad(), torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
-        sparse_seq = _model(input_ids, attention_mask)
+        sparse_seq, _ = _model(input_ids, attention_mask)
         sparse_vector = _model.to_pooled(sparse_seq, attention_mask)
 
     sparse_vector = sparse_vector.detach().float().requires_grad_(True)
@@ -82,7 +82,7 @@ def integrated_gradients_attribution(
     _model = unwrap_compiled(model)
 
     with torch.no_grad(), torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
-        sparse_seq = _model(input_ids, attention_mask)
+        sparse_seq, _ = _model(input_ids, attention_mask)
         sparse_vector = _model.to_pooled(sparse_seq, attention_mask)
 
     sparse_vector = sparse_vector.detach().float()
@@ -209,7 +209,7 @@ def attention_attribution(
 
     # Get per-position sparse representations via backbone (second encoder pass)
     with torch.inference_mode(), torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
-        sparse_sequence = _model._compute_sparse_sequence(
+        sparse_sequence, _ = _model._compute_sparse_sequence(
             attention_mask, input_ids=input_ids,
         )  # [B, L, V]
 

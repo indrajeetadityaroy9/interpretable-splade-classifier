@@ -20,7 +20,7 @@ import torch.nn
 from transformers import AutoModelForMaskedLM
 
 from splade.circuits.core import CircuitState
-from splade.models.layers.activation import DReLU
+from splade.models.layers.activation import GatedJumpReLU
 from splade.training.constants import CLASSIFIER_HIDDEN
 
 
@@ -51,8 +51,8 @@ class LexicalSAE(torch.nn.Module):
             inspect.signature(self.backbone.forward).parameters.keys()
         )
 
-        # DReLU activation gate
-        self.activation = DReLU(self.vocab_size)
+        # GatedJumpReLU activation gate
+        self.activation = GatedJumpReLU(self.vocab_size)
 
         # Shared ReLU MLP classifier (weight-tied across positions for NER)
         self.classifier_fc1 = torch.nn.Linear(self.vocab_size, CLASSIFIER_HIDDEN)
@@ -79,25 +79,26 @@ class LexicalSAE(torch.nn.Module):
         *,
         input_ids: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """SPLADE head: backbone MLM logits -> DReLU -> log1p -> mask.
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """SPLADE head: backbone MLM logits -> GatedJumpReLU -> mask.
 
         Runs the full backbone (encoder + MLM head) as a black box.
 
         Returns:
-            [B, L, V] per-position sparse representations (masked at padding).
+            sparse_seq: [B, L, V] per-position sparse representations (masked at padding).
+            gate_probs: [B, L, V] sigmoid gate probabilities for sparsity loss.
         """
         mlm_logits = self._backbone_forward(
             attention_mask, input_ids=input_ids, inputs_embeds=inputs_embeds,
         ).logits  # [B, L, V]
 
-        activated = self.activation(mlm_logits)
-        log_activations = torch.log1p(activated)
+        activated, gate_probs = self.activation(mlm_logits)
 
         # Zero out padding positions
-        return log_activations.masked_fill(
+        sparse_seq = activated.masked_fill(
             ~attention_mask.unsqueeze(-1).bool(), 0.0
         )
+        return sparse_seq, gate_probs
 
     def classify(
         self,
@@ -207,11 +208,12 @@ class LexicalSAE(torch.nn.Module):
         self,
         embeddings: torch.Tensor,
         attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward pass from pre-computed embeddings (for gradient-based attribution).
 
         Returns:
-            [B, L, V] sparse sequence.
+            sparse_seq: [B, L, V] sparse sequence.
+            gate_probs: [B, L, V] sigmoid gate probabilities.
         """
         return self._compute_sparse_sequence(attention_mask, inputs_embeds=embeddings)
 
@@ -245,10 +247,11 @@ class LexicalSAE(torch.nn.Module):
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Encode input to per-position sparse representations.
 
         Returns:
-            [B, L, V] sparse sequence. Use classify() or tag() for task-specific output.
+            sparse_seq: [B, L, V] sparse sequence. Use classify() or tag() for task-specific output.
+            gate_probs: [B, L, V] sigmoid gate probabilities for sparsity loss.
         """
         return self._compute_sparse_sequence(attention_mask, input_ids=input_ids)

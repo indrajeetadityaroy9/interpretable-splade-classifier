@@ -1,8 +1,32 @@
 # Lexical-SAE
 
-**Intrinsic, Exact Sequence Autoencoders for Interpretable NLP**
+**Lexical Terminal Transcoders for Interpretable NLP**
 
 Lexical-SAE is a general-purpose interpretability architecture that repurposes the tokenizer vocabulary as a sparse feature dictionary. Unlike post-hoc Sparse Autoencoders (SAEs) which suffer from reconstruction error and feature opacity, Lexical-SAE provides **(1)** zero reconstruction error via algebraic DLA identity, **(2)** a single task-agnostic architecture for classification and sequence labeling, and **(3)** surgical concept removal with mathematical guarantees.
+
+---
+
+## Architecture
+
+### GatedJumpReLU Activation
+
+The sparse bottleneck uses **GatedJumpReLU** — a learnable per-dimension gate with hard binary (Heaviside) forward pass and sigmoid straight-through estimator (STE) backward pass:
+
+```
+gate(x) = H(x - θ)           [forward: binary, preserves exact DLA]
+∂gate/∂θ ≈ -σ'(x - θ)       [backward: sigmoid STE for gradient flow]
+s(x) = relu(x) * gate(x)     [no magnitude shrinkage: active features keep full relu(x)]
+```
+
+This replaces the prior DReLU activation (`relu(x - θ)`), which suffered from feature shrinkage — active features lost magnitude proportional to the threshold.
+
+### Sparsity Control
+
+Gate sparsity is enforced via **L1 on sigmoid gate probabilities** (an L0 proxy), replacing the prior Hoyer sharpness loss. The gate probabilities are returned through the forward signature (not cached as instance state), making the architecture safe for DataParallel, gradient accumulation, and repeated forward calls.
+
+### LEACE Concept Erasure Baseline
+
+The surgery experiment includes a **LEACE** (Least-squares Concept Erasure) baseline using covariance-based projection via the `concept-erasure` library (Belrose et al. 2023). This provides a mathematically rigorous comparison for concept removal alongside the algebraic surgical suppression.
 
 ---
 
@@ -41,15 +65,19 @@ PER: **0.93** F1 | LOC: **0.88** F1 | ORG: **0.77** F1 | MISC: **0.72** F1
 | **Dictionary** | Learned Latents (Feature #1405) | **Vocabulary**|
 | **Granularity** | Layer-wise or Residual Stream | **Token-wise** (Sequence Modeling) |
 | **Intervention** | Approximate Steering | **Exact Removal** (Guaranteed $s_i=0$) |
+| **Activation** | TopK / ReLU | **GatedJumpReLU** (binary gate + STE) |
+| **Erasure Baseline** | None | **LEACE** (covariance-based) |
 
 ---
 
 ## Limitations
 
 - **Vocabulary-level granularity.** Attributions identify vocabulary tokens, not input spans. A clean vocab filter masks subword continuations and special tokens for human-readable output.
-- **Input-dependent W_eff.** The effective weight matrix varies per input due to the ReLU activation mask; explanations are per-sample, not global.
-- **Encoder family scope.** Tested on ModernBERT-base; compatible with any HuggingFace `AutoModelForMaskedLM` backbone but other encoders are not yet benchmarked.
-- **NER sparsity gap.** Sequence labeling achieves higher active dims (~2K) than classification (~100-200) due to the per-position sparse representation.
+- **Input-dependent W_eff.** The effective weight matrix varies per input due to the binary activation mask in both the GatedJumpReLU gate and the classifier ReLU; explanations are per-sample, not global.
+- **Encoder family scope.** Tested on ModernBERT-base and DistilBERT; compatible with any HuggingFace `AutoModelForMaskedLM` backbone but other encoders are not yet benchmarked.
+- **NER sparsity gap.** Sequence labeling achieves higher active dims (~2K) than classification (~100-200) due to the per-position `[B, L, V]` sparse representation.
+- **Single-sense vocabulary.** Each vocabulary dimension has a single learnable gate threshold. True polysemy (context-dependent word senses) would require hidden-state-dependent gating, which breaks the backbone-agnostic abstraction. Multi-sense expansion via K thresholds per dimension produces intensity quantization, not semantic polysemy.
+- **Log-compression removed.** The prior `log1p` transform has been removed to preserve raw activation magnitudes through the gate. Feature magnitudes may have higher variance; the `init_threshold=1.0` mitigates this by gating off small values in a sparse starting regime.
 
 ---
 
@@ -73,6 +101,7 @@ PER: **0.93** F1 | LOC: **0.88** F1 | ORG: **0.77** F1 | MISC: **0.72** F1
 - DeYoung, J., et al. (2020). ERASER: A Benchmark to Evaluate Rationalized NLP Models. *ACL*. [`arXiv:1911.03429`](https://arxiv.org/abs/1911.03429)
 - Madsen, A., et al. (2024). Are Faithfulness Measures Faithful? [`arXiv:2310.01538`](https://arxiv.org/abs/2310.01538)
 - Sundararajan, M., Taly, A., & Yan, Q. (2017). Axiomatic Attribution for Deep Networks. *ICML*. [`arXiv:1703.01365`](https://arxiv.org/abs/1703.01365)
+- Belrose, N., et al. (2023). LEACE: Perfect Linear Concept Erasure in Closed Form. *NeurIPS*. [`arXiv:2306.03819`](https://arxiv.org/abs/2306.03819)
 
 ### Mechanistic Interpretability
 

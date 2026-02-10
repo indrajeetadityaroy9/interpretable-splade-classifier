@@ -53,7 +53,7 @@ def _run_sae_comparison(
 
     for input_ids, attention_mask, label in zip(input_ids_list, attention_mask_list, labels):
         with torch.inference_mode(), torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
-            sparse_seq = _model(input_ids, attention_mask)
+            sparse_seq, _ = _model(input_ids, attention_mask)
             sparse_vector = _model.to_pooled(sparse_seq, attention_mask)
             transformed = _model._get_mlm_head_input(input_ids, attention_mask)
             cls_hidden = transformed[:, 0, :]
@@ -118,7 +118,7 @@ def run_mechanistic_evaluation(
         batch_labels_t = torch.tensor(labels[start:end], device=DEVICE)
 
         with torch.inference_mode(), torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
-            sparse_seq = _model(batch_ids, batch_mask)
+            sparse_seq, _ = _model(batch_ids, batch_mask)
             logits, sparse_vector, W_eff, b_eff = _model.classify(sparse_seq, batch_mask)
 
         preds = logits.argmax(dim=-1)

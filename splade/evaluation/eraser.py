@@ -176,7 +176,7 @@ def run_eraser_evaluation(
         batch_labels = labels_t[start:end]
 
         with torch.inference_mode(), torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
-            sparse_seq = _model(batch_ids, batch_mask)
+            sparse_seq, _ = _model(batch_ids, batch_mask)
             _, sparse_vector, W_eff, _ = _model.classify(sparse_seq, batch_mask)
 
         attr = compute_attribution_tensor(sparse_vector, W_eff, batch_labels)
