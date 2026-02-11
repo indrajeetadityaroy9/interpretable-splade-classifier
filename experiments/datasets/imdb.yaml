@@ -8,6 +8,3 @@ data:
 
 model:
   name: "answerdotai/ModernBERT-base"
-
-evaluation:
-  seeds: [42]

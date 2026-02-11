@@ -50,6 +50,7 @@ class GECOController:
         self._ema_constraint: float | None = None
         self._warmup_ces: list[float] = []
         self.tau_ce: float | None = None
+        self._warmup_finalized = False
 
     @property
     def lambda_ce(self) -> float:
@@ -67,7 +68,13 @@ class GECOController:
         no manual tau_margin constant needed. The 25th percentile
         represents "achievable good CE", tighter than the mean but
         not as aggressive as the minimum.
+
+        Idempotent: calling this multiple times returns the same tau
+        without recomputing or corrupting state.
         """
+        if self._warmup_finalized:
+            return self.tau_ce
+        self._warmup_finalized = True
         recent = self._warmup_ces[-50:] if len(self._warmup_ces) >= 50 else self._warmup_ces
         if len(recent) >= 4:
             self.tau_ce = statistics.quantiles(recent, n=4)[0]  # 25th percentile

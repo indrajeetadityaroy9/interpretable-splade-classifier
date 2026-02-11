@@ -94,41 +94,6 @@ def get_top_tokens(
     return list(zip(tokens, scores.tolist()))
 
 
-def suppress_token_globally(model: nn.Module, token_id: int) -> None:
-    """Permanently remove a token from the model's vocabulary.
-
-    Zeros the output embedding weights for this token, guaranteeing that
-    s[token_id] = 0 for all inputs. This is an irreversible, verifiable
-    safety guarantee: the concept cannot influence any class.
-
-    Mathematical guarantee: If the output projection weight[token_id, :] = 0
-    and bias[token_id] = 0, then the MLM logit for this token is always 0,
-    so after GatedJumpReLU (gate_threshold >> 0), s[token_id] = 0 for all inputs.
-    """
-    _model = unwrap_compiled(model)
-    output_emb = _model.backbone.get_output_embeddings()
-    with torch.no_grad():
-        output_emb.weight[token_id, :] = 0
-        if output_emb.bias is not None:
-            output_emb.bias[token_id] = 0
-        _model.activation.gate_threshold.data[token_id] = 1e6  # ensure gate blocks it
-
-
-def suppress_tokens_by_name(
-    model: nn.Module,
-    tokenizer,
-    token_names: list[str],
-) -> list[int]:
-    """Suppress multiple tokens by name. Returns list of suppressed token IDs."""
-    suppressed = []
-    for name in token_names:
-        ids = tokenizer.convert_tokens_to_ids([name])
-        if ids and ids[0] != tokenizer.unk_token_id:
-            suppress_token_globally(model, ids[0])
-            suppressed.append(ids[0])
-    return suppressed
-
-
 class SuppressedModel(nn.Module):
     """Inference-time wrapper that masks tokens in the sparse sequence.
 
@@ -145,19 +110,30 @@ class SuppressedModel(nn.Module):
         super().__init__()
         self.model = model
         _orig = unwrap_compiled(model)
-        mask = torch.ones(_orig.vocab_size, device=DEVICE)
+        mask = torch.ones(_orig.vocab_size_expanded, device=DEVICE)
         for tid in suppressed_token_ids:
             mask[tid] = 0.0
+        # Also suppress virtual sense slots for polysemous tokens
+        if hasattr(_orig, 'virtual_expander') and _orig.virtual_expander is not None:
+            V = _orig.vocab_size
+            vpe = _orig.virtual_expander
+            for tid in suppressed_token_ids:
+                if tid in vpe._token_to_idx:
+                    idx = vpe._token_to_idx[tid]
+                    M = vpe.num_senses
+                    for m in range(1, M):
+                        virtual_idx = V + idx * (M - 1) + (m - 1)
+                        mask[virtual_idx] = 0.0
         self.register_buffer("keep_mask", mask)
 
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Returns [B, L, V] sparse sequence with suppressed tokens zeroed."""
-        sparse_seq, gate_probs = self.model(input_ids, attention_mask)
-        return sparse_seq * self.keep_mask, gate_probs
+        sparse_seq, gate_mask, l0_probs = self.model(input_ids, attention_mask)
+        return sparse_seq * self.keep_mask, gate_mask, l0_probs
 
     def classify(
         self,
@@ -167,11 +143,6 @@ class SuppressedModel(nn.Module):
         """Max-pool and classify (delegates to underlying model)."""
         _orig = unwrap_compiled(self.model)
         return _orig.classify(sparse_sequence, attention_mask)
-
-    def tag(self, sparse_sequence: torch.Tensor) -> torch.Tensor:
-        """Per-position logits [B, L, C] (delegates to underlying model)."""
-        _orig = unwrap_compiled(self.model)
-        return _orig.tag(sparse_sequence)
 
     @staticmethod
     def to_pooled(
@@ -204,11 +175,12 @@ def evaluate_bias(
     max_length: int,
     batch_size: int = 64,
 ) -> dict:
-    """Compute accuracy and false positive rate broken down by identity group.
+    """Compute accuracy, FPR, and collateral damage broken down by identity group.
 
     Returns dict with:
         overall_accuracy, overall_fpr,
-        per_identity: {name: {accuracy, fpr, count, fpr_gap}}
+        per_identity: {name: {accuracy, fpr, count, fpr_gap}},
+        nontoxic_identity_accuracy, nontoxic_noidentity_accuracy, collateral_gap
     """
     from splade.inference import _predict_model
 
@@ -220,6 +192,12 @@ def evaluate_bias(
     neg_count = sum(1 for l in labels if l == 0)
     fp_count = sum(1 for p, l in zip(preds, labels) if p == 1 and l == 0)
     overall_fpr = fp_count / neg_count if neg_count > 0 else 0.0
+
+    # Collateral damage: accuracy on non-toxic samples with/without identity mentions
+    nontoxic_identity_correct = 0
+    nontoxic_identity_total = 0
+    nontoxic_noidentity_correct = 0
+    nontoxic_noidentity_total = 0
 
     # Per-identity metrics
     identity_names = set()
@@ -244,8 +222,136 @@ def evaluate_bias(
             "fpr_gap": g_fpr - overall_fpr,
         }
 
+    # Collateral damage computation
+    for i, (pred, label) in enumerate(zip(preds, labels)):
+        if label != 0:  # only non-toxic/safe samples
+            continue
+        has_identity = any(identities[i].get(name, False) for name in identity_names)
+        if has_identity:
+            nontoxic_identity_total += 1
+            if pred == label:
+                nontoxic_identity_correct += 1
+        else:
+            nontoxic_noidentity_total += 1
+            if pred == label:
+                nontoxic_noidentity_correct += 1
+
+    nontoxic_identity_acc = (
+        nontoxic_identity_correct / nontoxic_identity_total
+        if nontoxic_identity_total > 0 else 0.0
+    )
+    nontoxic_noidentity_acc = (
+        nontoxic_noidentity_correct / nontoxic_noidentity_total
+        if nontoxic_noidentity_total > 0 else 0.0
+    )
+    collateral_gap = nontoxic_identity_acc - nontoxic_noidentity_acc
+
     return {
         "overall_accuracy": overall_acc,
         "overall_fpr": overall_fpr,
         "per_identity": per_identity,
+        "nontoxic_identity_accuracy": nontoxic_identity_acc,
+        "nontoxic_noidentity_accuracy": nontoxic_noidentity_acc,
+        "collateral_gap": collateral_gap,
     }
+
+
+def analyze_weff_sign_flips(
+    model: nn.Module,
+    tokenizer,
+    texts: list[str],
+    labels: list[int],
+    target_tokens: list[str],
+    max_length: int,
+    batch_size: int = 64,
+    target_class: int = 1,
+) -> dict:
+    """Analyze W_eff sign flips for target tokens across samples.
+
+    For each target token, extracts W_eff[target_class, token_id] across all
+    samples where the token is active. Reports fraction with positive vs
+    negative sign. Sign flips prove the model is context-dependent.
+
+    Memory-efficient: computes W_eff externally via einsum on sliced weights,
+    never materializing the full [B, C, V] tensor.
+
+    Returns:
+        {token: {positive_frac, negative_frac, n_active, mean_magnitude}}
+    """
+    from torch.utils.data import DataLoader, TensorDataset
+
+    _model = unwrap_compiled(model)
+
+    token_ids = tokenizer.convert_tokens_to_ids(target_tokens)
+    valid = [(name, tid) for name, tid in zip(target_tokens, token_ids)
+             if tid != tokenizer.unk_token_id]
+    if not valid:
+        return {}
+
+    token_names, token_id_list = zip(*valid)
+    token_id_tensor = torch.tensor(token_id_list, device=DEVICE, dtype=torch.long)
+
+    encoding = tokenizer(
+        texts, max_length=max_length, padding="max_length",
+        truncation=True, return_tensors="pt",
+    )
+    loader = DataLoader(
+        TensorDataset(encoding["input_ids"], encoding["attention_mask"]),
+        batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True,
+    )
+
+    # Accumulators per token: count positive, negative, total magnitude
+    n_tokens = len(token_id_list)
+    pos_counts = torch.zeros(n_tokens, device=DEVICE)
+    neg_counts = torch.zeros(n_tokens, device=DEVICE)
+    mag_sums = torch.zeros(n_tokens, device=DEVICE)
+    active_counts = torch.zeros(n_tokens, device=DEVICE)
+
+    w1 = _model.classifier_fc1.weight  # [H, V]
+    w2 = _model.classifier_fc2.weight  # [C, H]
+    b1 = _model.classifier_fc1.bias    # [H]
+
+    w1_slice = w1[:, token_id_tensor]  # [H, n_tokens]
+
+    with torch.inference_mode(), torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
+        for batch_ids, batch_mask in loader:
+            batch_ids = batch_ids.to(DEVICE, non_blocking=True)
+            batch_mask = batch_mask.to(DEVICE, non_blocking=True)
+            sparse_seq, *_ = _model(batch_ids, batch_mask)
+            sparse_vector = _model.to_pooled(sparse_seq, batch_mask)  # [B, V]
+
+            # Compute ReLU mask from classifier hidden layer
+            h = _model.classifier_fc1(sparse_vector)  # [B, H]
+            mask = (h > 0).float()  # [B, H]
+
+            # W_eff_slice[b, c, t] = sum_h W2[c,h] * mask[b,h] * W1[h,t]
+            weff_slice = torch.einsum(
+                'ch,bh,ht->bct', w2.float(), mask.float(), w1_slice.float(),
+            )  # [B, C, n_tokens]
+
+            # Extract target class row
+            weff_target = weff_slice[:, target_class, :]  # [B, n_tokens]
+
+            # Check which tokens are active in each sample
+            sparse_slice = sparse_vector[:, token_id_tensor]  # [B, n_tokens]
+            is_active = sparse_slice > 0  # [B, n_tokens]
+
+            # Accumulate sign statistics only for active tokens
+            pos_counts += ((weff_target > 0) & is_active).float().sum(dim=0)
+            neg_counts += ((weff_target < 0) & is_active).float().sum(dim=0)
+            mag_sums += (weff_target.abs() * is_active.float()).sum(dim=0)
+            active_counts += is_active.float().sum(dim=0)
+
+    results = {}
+    for i, name in enumerate(token_names):
+        n_active = int(active_counts[i].item())
+        if n_active == 0:
+            continue
+        results[name] = {
+            "positive_frac": pos_counts[i].item() / n_active,
+            "negative_frac": neg_counts[i].item() / n_active,
+            "n_active": n_active,
+            "mean_magnitude": mag_sums[i].item() / n_active,
+        }
+
+    return results

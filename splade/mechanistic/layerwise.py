@@ -61,7 +61,7 @@ def decompose_sparse_vector_by_layer(
 
     # Clean forward pass
     with torch.inference_mode(), torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
-        sparse_seq_clean, _ = _model(input_ids, attention_mask)
+        sparse_seq_clean, *_ = _model(input_ids, attention_mask)
         sparse_clean = _model.to_pooled(sparse_seq_clean, attention_mask)
     sparse_clean = sparse_clean.float()
 
@@ -83,7 +83,7 @@ def decompose_sparse_vector_by_layer(
         hook_handle = layers[layer_idx].register_forward_hook(_zero_layer_hook)
         try:
             with torch.inference_mode(), torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
-                sparse_seq_ablated, _ = _model(input_ids, attention_mask)
+                sparse_seq_ablated, *_ = _model(input_ids, attention_mask)
                 sparse_ablated = _model.to_pooled(sparse_seq_ablated, attention_mask)
             sparse_ablated = sparse_ablated.float()
             contributions[:, layer_idx, :] = sparse_clean - sparse_ablated
@@ -121,7 +121,7 @@ def compute_layerwise_attribution(
 
     # Get W_eff for the target class
     with torch.inference_mode(), torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
-        sparse_seq, _ = _model(input_ids, attention_mask)
+        sparse_seq, *_ = _model(input_ids, attention_mask)
         W_eff = _model.classify(sparse_seq, attention_mask).W_eff
 
     device = W_eff.device
@@ -173,7 +173,7 @@ def run_layerwise_evaluation(
         reconstructed = contributions.sum(dim=1)  # [B, V]
 
         with torch.inference_mode(), torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
-            sparse_seq_actual, _ = _model(batch_ids, batch_mask)
+            sparse_seq_actual, *_ = _model(batch_ids, batch_mask)
             sparse_actual = _model.to_pooled(sparse_seq_actual, batch_mask)
         sparse_actual = sparse_actual.float()
 

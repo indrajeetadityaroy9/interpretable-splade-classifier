@@ -32,16 +32,16 @@ def test_scripts_argparse_clean(file_path):
 
     for arg_name in matches:
         arg_name = arg_name.strip("'\"")
-        if arg_name not in ["--config", "--help"]:
+        if arg_name not in ["--config", "--help", "--dataset"]:
              pytest.fail(f"Found extra CLI argument {arg_name} in {file_path}. Only --config is allowed.")
 
 
 def test_cis_config_knobs():
-    """Verify CIS exposes exactly 3 training knobs via TrainingConfig."""
+    """Verify CIS exposes exactly the expected training knobs via TrainingConfig."""
     from splade.config.schema import TrainingConfig
     knob_names = set(TrainingConfig.__dataclass_fields__.keys())
-    assert knob_names == {"target_accuracy", "sparsity_target", "warmup_fraction"}, \
-        f"TrainingConfig should have exactly 3 knobs, got: {knob_names}"
+    assert knob_names == {"sparsity_target", "warmup_fraction", "pooling", "learning_rate"}, \
+        f"TrainingConfig has unexpected knobs: {knob_names}"
 
     from splade.training.loop import train_model
     sig = inspect.signature(train_model)

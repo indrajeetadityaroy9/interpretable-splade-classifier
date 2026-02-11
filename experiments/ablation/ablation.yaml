@@ -2,12 +2,9 @@ experiment_name: "cis_ablation"
 output_dir: "results/ablation"
 
 data:
-  dataset_name: "sst2"
-  train_samples: -1  # full split: 67,349
-  test_samples: -1   # full split: 872
+  dataset_name: "banking77"
+  train_samples: -1  # full: 10,003
+  test_samples: -1   # full: 3,080
 
 model:
   name: "answerdotai/ModernBERT-base"
-
-evaluation:
-  seeds: [42]

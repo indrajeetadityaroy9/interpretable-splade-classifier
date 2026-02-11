@@ -2,15 +2,9 @@ experiment_name: "verification"
 output_dir: "results/verification"
 
 data:
-  dataset_name: "sst2"
+  dataset_name: "banking77"
   train_samples: 200
   test_samples: 50
 
 model:
   name: "answerdotai/ModernBERT-base"
-
-evaluation:
-  seeds: [42]
-
-mechanistic:
-  circuit_fraction: 0.1

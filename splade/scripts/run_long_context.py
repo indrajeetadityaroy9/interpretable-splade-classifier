@@ -18,7 +18,6 @@ from dataclasses import asdict
 import yaml
 
 from splade.config.load import load_config
-from splade.data.loader import load_dataset_by_name
 from splade.inference import score_model
 from splade.pipelines import setup_and_train
 
@@ -56,7 +55,7 @@ def main() -> None:
     print("LONG-CONTEXT NEEDLE IN HAYSTACK EXPERIMENT")
     print(f"{'=' * 60}")
 
-    seed = config.evaluation.seeds[0]
+    seed = config.seed
 
     # Train on standard-length texts
     print("\n--- Training Lexical-SAE ---")

@@ -1,16 +1,10 @@
-experiment_name: "sst2_distilbert"
+experiment_name: "banking77_benchmark"
 output_dir: "results/main/benchmark"
 
 data:
-  dataset_name: "sst2"
-  train_samples: -1  # full split: 67,349
-  test_samples: -1   # full split: 872
+  dataset_name: "banking77"
+  train_samples: -1  # full: 10,003
+  test_samples: -1   # full: 3,080
 
 model:
   name: "answerdotai/ModernBERT-base"
-
-evaluation:
-  seeds: [42]
-
-mechanistic:
-  circuit_fraction: 0.1

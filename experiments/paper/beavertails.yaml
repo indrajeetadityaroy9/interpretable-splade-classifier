@@ -1,0 +1,10 @@
+experiment_name: "paper_beavertails"
+output_dir: "results/paper/beavertails"
+
+data:
+  dataset_name: "beavertails"
+  train_samples: -1  # full 30k: ~27,200
+  test_samples: -1   # full 30k: ~3,020
+
+model:
+  name: "answerdotai/ModernBERT-base"

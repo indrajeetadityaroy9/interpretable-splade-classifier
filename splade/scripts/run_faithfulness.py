@@ -28,40 +28,40 @@ def main() -> None:
     with open(os.path.join(config.output_dir, "resolved_config.yaml"), "w") as f:
         yaml.dump(asdict(config), f)
 
-    all_results = []
-    for seed in config.evaluation.seeds:
-        print(f"\n{'=' * 60}")
-        print(f"FAITHFULNESS EXPERIMENT — SEED {seed}")
-        print(f"{'=' * 60}")
+    seed = config.seed
 
-        # Train
-        print("\n--- Training Lexical-SAE ---")
-        exp = setup_and_train(config, seed)
-        print(f"Test accuracy: {exp.accuracy:.4f}")
+    print(f"\n{'=' * 60}")
+    print(f"FAITHFULNESS EXPERIMENT — SEED {seed}")
+    print(f"{'=' * 60}")
 
-        # Removability comparison
-        print("\n--- Removability Comparison ---")
-        comparison = compare_with_baseline_explainer(
-            exp.model, exp.tokenizer,
-            exp.test_texts, exp.test_labels,
-            exp.max_length, top_k=5, batch_size=exp.batch_size,
-        )
+    # Train
+    print("\n--- Training Lexical-SAE ---")
+    exp = setup_and_train(config, seed)
+    print(f"Test accuracy: {exp.accuracy:.4f}")
 
-        # Print table
-        print(f"\n{'Explainer':<25} {'Flip Rate':>10} {'Prob Drop':>10} {'Time (s)':>10}")
-        print("-" * 55)
-        for name, metrics in comparison.items():
-            print(f"{name:<25} {metrics['flip_rate']:>10.3f} {metrics['mean_prob_drop']:>10.3f} {metrics['time_seconds']:>10.2f}")
+    # Removability comparison
+    print("\n--- Removability Comparison ---")
+    comparison = compare_with_baseline_explainer(
+        exp.model, exp.tokenizer,
+        exp.test_texts, exp.test_labels,
+        exp.max_length, top_k=5, batch_size=exp.batch_size,
+    )
 
-        all_results.append({
-            "seed": seed,
-            "accuracy": exp.accuracy,
-            "comparison": comparison,
-        })
+    # Print table
+    print(f"\n{'Explainer':<25} {'Flip Rate':>10} {'Prob Drop':>10} {'Time (s)':>10}")
+    print("-" * 55)
+    for name, metrics in comparison.items():
+        print(f"{name:<25} {metrics['flip_rate']:>10.3f} {metrics['mean_prob_drop']:>10.3f} {metrics['time_seconds']:>10.2f}")
+
+    result = {
+        "seed": seed,
+        "accuracy": exp.accuracy,
+        "comparison": comparison,
+    }
 
     output_path = os.path.join(config.output_dir, "faithfulness_results.json")
     with open(output_path, "w") as f:
-        json.dump(all_results, f, indent=2)
+        json.dump(result, f, indent=2)
     print(f"\nResults saved to {output_path}")
 
 

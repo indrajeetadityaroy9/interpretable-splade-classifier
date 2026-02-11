@@ -1,44 +1,67 @@
-"""LexicalSAE: unified sparse autoencoder for classification and sequence labeling.
+"""LexicalSAE: sparse autoencoder for interpretable text classification.
 
-Single architecture producing per-position sparse representations [B, L, V].
-Callers choose the task-specific head: classify() for document-level classification
-(max-pool over positions) or tag() for per-position sequence labeling (NER).
+Produces per-position sparse representations [B, L, V] from a pretrained MLM
+backbone, then pools and classifies via a ReLU MLP head with exact DLA:
+
+    logit[c] = sum_j(s[j] * W_eff[c,j]) + b_eff[c]
 
 Uses AutoModelForMaskedLM as a black-box backbone, delegating architecture
 compatibility (BERT, DistilBERT, RoBERTa, ModernBERT, etc.) to HuggingFace.
-
-DLA identity (per position or per document):
-    logit[c] = sum_j(s[j] * W_eff[c,j]) + b_eff[c]
-
-where W_eff depends on the ReLU activation mask at the given position/document.
 """
 
 import inspect
 
 import torch
 import torch.nn
+import torch.nn.functional as F
 from transformers import AutoModelForMaskedLM
 
 from splade.circuits.core import CircuitState
-from splade.models.layers.activation import GatedJumpReLU
+from splade.models.layers.activation import JumpReLUGate
 from splade.training.constants import CLASSIFIER_HIDDEN
 
 
+class AttentionPool(torch.nn.Module):
+    """Learned attention-weighted pooling over sequence positions.
+
+    Computes a scalar attention score per position, then weighted-sums
+    the sparse vectors. Preserves DLA identity since pooling precedes
+    the classifier (W_eff is derived from the pooled vector).
+    """
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.query = torch.nn.Linear(dim, 1, bias=False)
+
+    def forward(
+        self, sparse_seq: torch.Tensor, attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        scores = self.query(sparse_seq).squeeze(-1)  # [B, L]
+        scores = scores.masked_fill(~attention_mask.bool(), -1e9)
+        weights = F.softmax(scores, dim=1)  # [B, L]
+        return (sparse_seq * weights.unsqueeze(-1)).sum(dim=1)  # [B, V]
+
+
 class LexicalSAE(torch.nn.Module):
-    """Unified Lexical Sparse Autoencoder.
+    """Lexical Sparse Autoencoder for interpretable classification.
 
     Args:
         model_name: HuggingFace model name (e.g. "answerdotai/ModernBERT-base").
-        num_labels: Number of output classes/tags.
+        num_labels: Number of output classes.
+        vpe_config: Optional VPE configuration for polysemy expansion.
+        pooling: Pooling strategy ("max" or "attention").
     """
 
     def __init__(
         self,
         model_name: str,
         num_labels: int,
+        vpe_config=None,
+        pooling: str = "max",
     ):
         super().__init__()
         self.num_labels = num_labels
+        self._pooling_mode = pooling
 
         # Black-box backbone: encoder + MLM head in one module
         self.backbone = AutoModelForMaskedLM.from_pretrained(
@@ -51,17 +74,50 @@ class LexicalSAE(torch.nn.Module):
             inspect.signature(self.backbone.forward).parameters.keys()
         )
 
-        # GatedJumpReLU activation gate
-        self.activation = GatedJumpReLU(self.vocab_size)
+        # Virtual Polysemy Expansion
+        self.virtual_expander = None
+        self._captured_hidden = None
+        expanded_dim = self.vocab_size
+        if vpe_config and vpe_config.enabled and vpe_config.token_ids:
+            from splade.models.layers.virtual_expander import VirtualExpander
+            self.virtual_expander = VirtualExpander(
+                backbone_hidden_dim=self.backbone.config.hidden_size,
+                polysemous_token_ids=vpe_config.token_ids,
+                num_senses=vpe_config.num_senses,
+            )
+            expanded_dim = self.vocab_size + self.virtual_expander.num_virtual_slots
+            # Persistent hook to capture hidden states for VPE
+            self.backbone.get_output_embeddings().register_forward_pre_hook(
+                self._capture_hook
+            )
 
-        # Shared ReLU MLP classifier (weight-tied across positions for NER)
-        self.classifier_fc1 = torch.nn.Linear(self.vocab_size, CLASSIFIER_HIDDEN)
+        # JumpReLU gate (exact binary gates for DLA identity)
+        self.activation = JumpReLUGate(expanded_dim)
+
+        # Attention-weighted pooling (optional, default: max-pool)
+        self.attention_pool = (
+            AttentionPool(expanded_dim) if pooling == "attention" else None
+        )
+
+        # ReLU MLP classifier head
+        self.classifier_fc1 = torch.nn.Linear(expanded_dim, CLASSIFIER_HIDDEN)
         self.classifier_fc2 = torch.nn.Linear(CLASSIFIER_HIDDEN, num_labels)
+
+    @property
+    def vocab_size_expanded(self) -> int:
+        """Effective sparse vector dimensionality (V + virtual slots if VPE active)."""
+        if self.virtual_expander:
+            return self.vocab_size + self.virtual_expander.num_virtual_slots
+        return self.vocab_size
 
     @property
     def encoder(self) -> torch.nn.Module:
         """The base encoder (e.g. BertModel, ModernBertModel) within the backbone."""
         return getattr(self.backbone, self.backbone.base_model_prefix)
+
+    def _capture_hook(self, module, args):
+        """Persistent hook capturing hidden states before output projection."""
+        self._captured_hidden = args[0]
 
     def _backbone_forward(self, attention_mask, *, input_ids=None, inputs_embeds=None):
         """Run backbone with cleaned kwargs."""
@@ -79,57 +135,51 @@ class LexicalSAE(torch.nn.Module):
         *,
         input_ids: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """SPLADE head: backbone MLM logits -> GatedJumpReLU -> mask.
-
-        Runs the full backbone (encoder + MLM head) as a black box.
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """SPLADE head: backbone MLM logits -> [VPE expansion] -> JumpReLU gate.
 
         Returns:
-            sparse_seq: [B, L, V] per-position sparse representations (masked at padding).
-            gate_probs: [B, L, V] sigmoid gate probabilities for sparsity loss.
+            sparse_seq: [B, L, V_expanded] per-position sparse representations.
+            gate_mask: [B, L, V_expanded] binary gate mask {0,1}.
+            l0_probs: [B, L, V_expanded] differentiable P(z > θ) for L0 loss.
         """
         mlm_logits = self._backbone_forward(
             attention_mask, input_ids=input_ids, inputs_embeds=inputs_embeds,
         ).logits  # [B, L, V]
 
-        activated, gate_probs = self.activation(mlm_logits)
+        if self.virtual_expander is not None and self._captured_hidden is not None:
+            mlm_logits = self.virtual_expander(self._captured_hidden, mlm_logits)
+
+        activated, gate_mask, l0_probs = self.activation(mlm_logits)
 
         # Zero out padding positions
         sparse_seq = activated.masked_fill(
             ~attention_mask.unsqueeze(-1).bool(), 0.0
         )
-        return sparse_seq, gate_probs
+        return sparse_seq, gate_mask, l0_probs
 
     def classify(
         self,
         sparse_sequence: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> CircuitState:
-        """Max-pool sparse sequence and classify.
+        """Pool sparse sequence and classify.
+
+        Uses attention-weighted pooling if configured, otherwise max-pool.
 
         Args:
-            sparse_sequence: [B, L, V] per-position sparse representations.
+            sparse_sequence: [B, L, V_expanded] per-position sparse representations.
             attention_mask: [B, L] attention mask.
 
         Returns:
             CircuitState(logits, sparse_vector, W_eff, b_eff).
         """
-        sparse_vector = self.to_pooled(sparse_sequence, attention_mask)
+        if self.attention_pool is not None:
+            sparse_vector = self.attention_pool(sparse_sequence, attention_mask)
+        else:
+            sparse_vector = self.to_pooled(sparse_sequence, attention_mask)
         logits, W_eff, b_eff = self.classifier_forward(sparse_vector)
         return CircuitState(logits, sparse_vector, W_eff, b_eff)
-
-    def tag(self, sparse_sequence: torch.Tensor) -> torch.Tensor:
-        """Per-position classification logits.
-
-        Args:
-            sparse_sequence: [B, L, V] per-position sparse representations.
-
-        Returns:
-            [B, L, C] per-position logits.
-        """
-        B, L, V = sparse_sequence.shape
-        flat = sparse_sequence.view(B * L, V)
-        return self.classifier_logits_only(flat).view(B, L, self.num_labels)
 
     def classifier_forward(
         self, sparse_vector: torch.Tensor,
@@ -143,7 +193,7 @@ class LexicalSAE(torch.nn.Module):
 
         Returns:
             logits: [B, C] classification logits.
-            W_eff: [B, C, V] effective weight matrix for exact DLA.
+            W_eff: [B, C, V_expanded] effective weight matrix for exact DLA.
             b_eff: [B, C] effective bias vector.
         """
         pre_relu = self.classifier_fc1(sparse_vector)
@@ -151,7 +201,7 @@ class LexicalSAE(torch.nn.Module):
         hidden = pre_relu * activation_mask
         logits = self.classifier_fc2(hidden)
 
-        W1 = self.classifier_fc1.weight  # [H, V]
+        W1 = self.classifier_fc1.weight  # [H, V_expanded]
         W2 = self.classifier_fc2.weight  # [C, H]
         b1 = self.classifier_fc1.bias    # [H]
         b2 = self.classifier_fc2.bias    # [C]
@@ -170,52 +220,16 @@ class LexicalSAE(torch.nn.Module):
         """Return classifier head parameters (for optimizer param groups)."""
         return list(self.classifier_fc1.parameters()) + list(self.classifier_fc2.parameters())
 
-    def compute_weff_for_positions(
-        self,
-        sparse_sequence: torch.Tensor,
-        position_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compute W_eff only for selected positions (memory-efficient).
-
-        Args:
-            sparse_sequence: [B, L, V] full sparse sequence.
-            position_mask: [B, L] bool mask selecting positions.
-
-        Returns:
-            sparse_selected: [N, V] selected position vectors.
-            W_eff: [N, C, V] effective weight matrix for selected positions.
-            b_eff: [N, C] effective bias for selected positions.
-        """
-        sparse_selected = sparse_sequence[position_mask]  # [N, V]
-        return self.classifier_forward(sparse_selected)
-
     @staticmethod
     def to_pooled(
         sparse_sequence: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Max-pool [B, L, V] to [B, V]."""
+        """Max-pool [B, L, V_expanded] to [B, V_expanded]."""
         masked = sparse_sequence.masked_fill(
             ~attention_mask.unsqueeze(-1).bool(), 0.0
         )
         return masked.max(dim=1).values
-
-    def get_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Get input embeddings (architecture-agnostic)."""
-        return self.backbone.get_input_embeddings()(input_ids)
-
-    def forward_from_embeddings(
-        self,
-        embeddings: torch.Tensor,
-        attention_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass from pre-computed embeddings (for gradient-based attribution).
-
-        Returns:
-            sparse_seq: [B, L, V] sparse sequence.
-            gate_probs: [B, L, V] sigmoid gate probabilities.
-        """
-        return self._compute_sparse_sequence(attention_mask, inputs_embeds=embeddings)
 
     def _get_mlm_head_input(
         self,
@@ -247,11 +261,12 @@ class LexicalSAE(torch.nn.Module):
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Encode input to per-position sparse representations.
 
         Returns:
-            sparse_seq: [B, L, V] sparse sequence. Use classify() or tag() for task-specific output.
-            gate_probs: [B, L, V] sigmoid gate probabilities for sparsity loss.
+            sparse_seq: [B, L, V_expanded] sparse sequence.
+            gate_mask: [B, L, V_expanded] binary gate mask {0,1}.
+            l0_probs: [B, L, V_expanded] differentiable P(z > θ) for L0 loss.
         """
         return self._compute_sparse_sequence(attention_mask, input_ids=input_ids)

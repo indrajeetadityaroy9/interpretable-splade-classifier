@@ -33,6 +33,8 @@ class TrainedExperiment:
     accuracy: float
     seed: int
     centroid_tracker: AttributionCentroidTracker | None = None
+    val_texts: list[str] | None = None
+    val_labels: list[int] | None = None
 
 
 def setup_and_train(config: Config, seed: int) -> TrainedExperiment:
@@ -50,26 +52,26 @@ def setup_and_train(config: Config, seed: int) -> TrainedExperiment:
     max_length = infer_max_length(train_texts, tokenizer, model_name=config.model.name)
     batch_size = _infer_batch_size(config.model.name, max_length)
 
-    val_size = min(200, len(train_texts) // 5)
+    val_size = max(50, min(2000, len(train_texts) // 10))
     val_texts = train_texts[-val_size:]
     val_labels = train_labels[-val_size:]
     train_texts_split = train_texts[:-val_size]
     train_labels_split = train_labels[:-val_size]
 
-    model = LexicalSAE(config.model.name, num_labels).to(DEVICE)
-    # torch.compile disabled: bf16 autocast dtype mismatch on PyTorch 2.7
-    # (addmm gets Float vs BFloat16). Batched eval loops provide the main
-    # throughput improvement.
-    # model = torch.compile(model, dynamic=True)
+    model = LexicalSAE(
+        config.model.name, num_labels,
+        vpe_config=config.vpe,
+        pooling=config.training.pooling,
+    ).to(DEVICE)
 
     centroid_tracker = train_model(
         model, tokenizer, train_texts_split, train_labels_split,
         model_name=config.model.name, num_labels=num_labels,
         val_texts=val_texts, val_labels=val_labels,
         max_length=max_length, batch_size=batch_size,
-        target_accuracy=config.training.target_accuracy,
         sparsity_target=config.training.sparsity_target,
         warmup_fraction=config.training.warmup_fraction,
+        learning_rate=config.training.learning_rate,
     )
 
     accuracy = score_model(
@@ -90,6 +92,8 @@ def setup_and_train(config: Config, seed: int) -> TrainedExperiment:
         accuracy=accuracy,
         seed=seed,
         centroid_tracker=centroid_tracker,
+        val_texts=val_texts,
+        val_labels=val_labels,
     )
 
 

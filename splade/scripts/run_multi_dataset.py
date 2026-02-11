@@ -1,4 +1,4 @@
-"""Multi-dataset CIS benchmark: SST-2, AG News, e-SNLI.
+"""Multi-dataset CIS benchmark: Banking77, IMDB, BeaverTails.
 
 Runs the full CIS pipeline on each dataset and produces a combined
 results table for paper evaluation.
@@ -14,13 +14,13 @@ from splade.scripts.run_experiment import run_experiment
 
 
 PAPER_DATASETS = {
-    "sst2": {"train_samples": -1, "test_samples": -1},
-    "ag_news": {"train_samples": -1, "test_samples": -1},
+    "banking77": {"train_samples": -1, "test_samples": -1},
     "imdb": {"train_samples": -1, "test_samples": -1},
+    "beavertails": {"train_samples": -1, "test_samples": -1},
 }
 
 
-def run_multi_dataset(config) -> dict[str, list[dict]]:
+def run_multi_dataset(config) -> dict[str, dict]:
     """Run full CIS pipeline on each dataset, return combined results."""
     all_results = {}
     base_output = config.output_dir
@@ -37,8 +37,8 @@ def run_multi_dataset(config) -> dict[str, list[dict]]:
         ds_config.output_dir = os.path.join(base_output, dataset_name)
         ds_config.experiment_name = f"cis_{dataset_name}"
 
-        results = run_experiment(ds_config)
-        all_results[dataset_name] = results
+        result = run_experiment(ds_config)
+        all_results[dataset_name] = result
 
     _print_combined_table(all_results)
     _save_combined(base_output, all_results)
@@ -46,7 +46,7 @@ def run_multi_dataset(config) -> dict[str, list[dict]]:
     return all_results
 
 
-def _print_combined_table(all_results: dict[str, list[dict]]) -> None:
+def _print_combined_table(all_results: dict[str, dict]) -> None:
     print(f"\n{'=' * 100}")
     print("MULTI-DATASET RESULTS")
     print(f"{'=' * 100}")
@@ -58,18 +58,17 @@ def _print_combined_table(all_results: dict[str, list[dict]]) -> None:
     print(header)
     print("-" * 100)
 
-    for dataset_name, results_list in all_results.items():
-        for r in results_list:
-            eraser = r.get("eraser_metrics", {})
-            sf = r.get("semantic_fidelity", {})
-            print(
-                f"{dataset_name:<12} "
-                f"{r['accuracy']:>8.4f} "
-                f"{r['dla_verification_error']:>10.6f} "
-                f"{eraser.get('aopc_comprehensiveness', 0):>8.4f} "
-                f"{eraser.get('aopc_sufficiency', 0):>8.4f} "
-                f"{sf.get('class_separation', 0):>10.4f}"
-            )
+    for dataset_name, r in all_results.items():
+        eraser = r.get("eraser_metrics", {})
+        sf = r.get("semantic_fidelity", {})
+        print(
+            f"{dataset_name:<12} "
+            f"{r['accuracy']:>8.4f} "
+            f"{r['dla_verification_error']:>10.6f} "
+            f"{eraser.get('aopc_comprehensiveness', 0):>8.4f} "
+            f"{eraser.get('aopc_sufficiency', 0):>8.4f} "
+            f"{sf.get('class_separation', 0):>10.4f}"
+        )
     print(f"{'=' * 100}")
 
 

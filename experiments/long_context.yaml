@@ -8,9 +8,3 @@ data:
 
 model:
   name: "answerdotai/ModernBERT-base"
-
-evaluation:
-  seeds: [42]
-
-mechanistic:
-  circuit_fraction: 0.1

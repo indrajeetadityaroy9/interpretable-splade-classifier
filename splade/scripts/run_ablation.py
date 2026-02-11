@@ -58,7 +58,7 @@ def main() -> None:
     args = parser.parse_args()
 
     config = load_config(args.config)
-    seed = config.evaluation.seeds[0]
+    seed = config.seed
 
     print(f"\nAblation: {config.data.dataset_name}, {config.data.train_samples} train, "
           f"{config.data.test_samples} test, seed={seed}")

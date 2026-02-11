@@ -1,86 +1,28 @@
-import copy
-import itertools
 import math
 
-import numpy as np
 import torch
+from schedulefree import AdamWScheduleFree
 from transformers import AutoConfig
 
-from splade.training.constants import (LR_FIND_DIVERGE_FACTOR, LR_FIND_END,
-                                       LR_FIND_STEPS, WEIGHT_DECAY)
-from splade.utils.cuda import COMPUTE_DTYPE, DEVICE, unwrap_compiled
+from splade.utils.cuda import unwrap_compiled
 
 
-def find_lr(
+def build_optimizer(
     model: torch.nn.Module,
-    train_loader: torch.utils.data.DataLoader,
-    num_labels: int,
-) -> float:
-    _orig = unwrap_compiled(model)
-    saved_state = copy.deepcopy(_orig.state_dict())
+    base_lr: float = 3e-4,
+) -> AdamWScheduleFree:
+    """Build Schedule-Free AdamW optimizer (Defazio & Mishchenko, arXiv:2405.15682).
 
-    temp_optimizer = torch.optim.AdamW(_orig.parameters(), lr=LR_FIND_END, fused=True)
-    criterion = (
-        torch.nn.BCEWithLogitsLoss()
-        if num_labels == 1
-        else torch.nn.CrossEntropyLoss()
-    )
+    Subsumes LR scheduling, warmup, and model EMA into a single optimizer via
+    Primal Averaging. Call optimizer.train() during training steps and
+    optimizer.eval() before validation/inference to switch to averaged params.
 
-    start_lr = 1e-7
-    lr_mult = (LR_FIND_END / start_lr) ** (1.0 / LR_FIND_STEPS)
-    current_lr = start_lr
-    best_loss = float("inf")
-    lrs: list[float] = []
-    losses: list[float] = []
-
-    data_iter = itertools.cycle(train_loader)
-    _orig.train()
-
-    for _ in range(LR_FIND_STEPS):
-        batch = next(data_iter)
-
-        batch_ids, batch_mask, batch_labels = (b.to(DEVICE, non_blocking=True) for b in batch)
-
-        for g in temp_optimizer.param_groups:
-            g["lr"] = current_lr
-
-        temp_optimizer.zero_grad(set_to_none=True)
-        with torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
-            sparse_seq, _ = model(batch_ids, batch_mask)
-            logits = _orig.classify(sparse_seq, batch_mask).logits
-            loss = (
-                criterion(logits.squeeze(-1), batch_labels)
-                if num_labels == 1
-                else criterion(logits, batch_labels.view(-1))
-            )
-        loss.backward()
-        temp_optimizer.step()
-
-        loss_val = loss.item()
-        lrs.append(current_lr)
-        losses.append(loss_val)
-        best_loss = min(best_loss, loss_val)
-
-        if loss_val > LR_FIND_DIVERGE_FACTOR * best_loss and len(losses) > 10:
-            break
-
-        current_lr *= lr_mult
-
-    _orig.load_state_dict(saved_state)
-
-    if len(losses) < 10:
-        return 3e-5
-
-    window = min(10, len(losses) // 3)
-    kernel = np.ones(window) / window
-    smoothed = np.convolve(losses, kernel, mode="valid")
-    gradients = np.gradient(smoothed)
-    best_idx = int(np.argmin(gradients))
-    offset = window // 2
-    found_lr = lrs[best_idx + offset]
-
-    found_lr = max(1e-6, min(1e-3, found_lr))
-    return found_lr
+    Args:
+        model: The model to optimize.
+        base_lr: Base learning rate (default 3e-4, the standard AdamW default).
+    """
+    param_groups = _build_param_groups(model, base_lr)
+    return AdamWScheduleFree(param_groups, warmup_steps=0)
 
 
 def _infer_batch_size(model_name: str, max_length: int) -> int:
@@ -105,6 +47,12 @@ def _infer_batch_size(model_name: str, max_length: int) -> int:
 
 
 def _build_param_groups(model: torch.nn.Module, base_lr: float) -> list[dict]:
+    """Build param groups with derived weight decay.
+
+    Weight decay is derived as 0.1 * base_lr (Loshchilov-Hutter scaling),
+    eliminating the need for a separate WEIGHT_DECAY constant.
+    """
+    weight_decay = 0.1 * base_lr
     _orig = unwrap_compiled(model)
     decay_params: list[torch.nn.Parameter] = []
     no_decay_params: list[torch.nn.Parameter] = []
@@ -116,7 +64,7 @@ def _build_param_groups(model: torch.nn.Module, base_lr: float) -> list[dict]:
         else:
             decay_params.append(param)
     return [
-        {"params": decay_params, "lr": base_lr, "weight_decay": WEIGHT_DECAY},
+        {"params": decay_params, "lr": base_lr, "weight_decay": weight_decay},
         {"params": no_decay_params, "lr": base_lr, "weight_decay": 0.0},
     ]
 
@@ -126,23 +74,20 @@ def _build_param_groups_with_gate_boost(
     base_lr: float,
     gate_lr_multiplier: float = 5.0,
 ) -> list[dict]:
-    """Build param groups with boosted LR for DReLU sparsity gates.
+    """Build param groups with boosted LR for sparsity gates.
 
     Creates three groups:
       1. Weight-decayed params (matrices, excluding gates)
       2. Non-decayed params (biases, norms, excluding gates)
-      3. Gate params (activation.theta) with boosted LR, no decay
-
-    The gate boost gives the optimizer more "kinetic energy" to push
-    DReLU thresholds upward, overcoming the CE gradient inertia that
-    otherwise traps the model in a dense local minimum.
+      3. Gate params (activation.log_threshold) with boosted LR, no decay
     """
+    weight_decay = 0.1 * base_lr
     _orig = unwrap_compiled(model)
     decay_params: list[torch.nn.Parameter] = []
     no_decay_params: list[torch.nn.Parameter] = []
     gate_params: list[torch.nn.Parameter] = []
 
-    gate_identifiers = ["thresholds", "theta", "gate"]
+    gate_identifiers = ["log_threshold"]
     boosted_names: list[str] = []
 
     for name, param in _orig.named_parameters():
@@ -156,15 +101,13 @@ def _build_param_groups_with_gate_boost(
         else:
             decay_params.append(param)
 
-    print(f"DEBUG: Boosting LR for sparsity gates: {boosted_names}")
     if not boosted_names:
         raise ValueError(
-            f"No sparsity gates found matching {gate_identifiers}. "
-            "Check splade/models/layers/activation.py for actual param name."
+            f"No sparsity gates found matching {gate_identifiers}."
         )
 
     return [
-        {"params": decay_params, "lr": base_lr, "weight_decay": WEIGHT_DECAY, "_lr_multiplier": 1.0},
+        {"params": decay_params, "lr": base_lr, "weight_decay": weight_decay, "_lr_multiplier": 1.0},
         {"params": no_decay_params, "lr": base_lr, "weight_decay": 0.0, "_lr_multiplier": 1.0},
         {"params": gate_params, "lr": base_lr * gate_lr_multiplier, "weight_decay": 0.0, "_lr_multiplier": gate_lr_multiplier},
     ]
@@ -195,20 +138,3 @@ def _gradient_centralization(
                 dim=tuple(range(1, parameter.grad.data.ndim)),
                 keepdim=True,
             )
-
-
-class _LRScheduler:
-
-    def __init__(self, base_lr: float, total_steps: int, warmup_steps: int):
-        self.base_lr = base_lr
-        self.total_steps = total_steps
-        self.warmup_steps = warmup_steps
-        self._step = 0
-
-    def step(self) -> float:
-        current_step = self._step
-        self._step += 1
-        if current_step < self.warmup_steps:
-            return self.base_lr * (current_step / max(self.warmup_steps, 1))
-        progress = (current_step - self.warmup_steps) / max(self.total_steps - self.warmup_steps, 1)
-        return self.base_lr * 0.5 * (1 + math.cos(math.pi * progress))

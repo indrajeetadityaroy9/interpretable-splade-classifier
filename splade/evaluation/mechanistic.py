@@ -10,8 +10,7 @@ from splade.circuits.metrics import (VocabularyCircuit,
                                      extract_vocabulary_circuit,
                                      measure_circuit_completeness,
                                      measure_separation_cosine,
-                                     measure_separation_jaccard,
-                                     visualize_circuit)
+                                     measure_separation_jaccard)
 from splade.utils.cuda import COMPUTE_DTYPE, DEVICE, unwrap_compiled
 
 
@@ -27,6 +26,7 @@ class MechanisticResults:
     explainer_comparison: dict = field(default_factory=dict)
     layerwise_attribution: dict = field(default_factory=dict)
     sae_comparison: dict = field(default_factory=dict)
+    polysemy_scores: dict = field(default_factory=dict)
 
 
 def _run_sae_comparison(
@@ -53,7 +53,7 @@ def _run_sae_comparison(
 
     for input_ids, attention_mask, label in zip(input_ids_list, attention_mask_list, labels):
         with torch.inference_mode(), torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
-            sparse_seq, _ = _model(input_ids, attention_mask)
+            sparse_seq, *_ = _model(input_ids, attention_mask)
             sparse_vector = _model.to_pooled(sparse_seq, attention_mask)
             transformed = _model._get_mlm_head_input(input_ids, attention_mask)
             cls_hidden = transformed[:, 0, :]
@@ -83,10 +83,17 @@ def _run_sae_comparison(
             reconstruction, hidden_tensor,
         ).item())
 
+        # Dead feature analysis
+        all_features = sae.encode(hidden_tensor)
+        ever_active = (all_features > 0).any(dim=0)
+        dead_frac = 1.0 - ever_active.float().mean().item()
+
     return {
         "dla_active_tokens": sum(dla_active_counts) / len(dla_active_counts),
         "sae_active_features": sum(sae_active_counts) / len(sae_active_counts),
         "reconstruction_error": recon_error,
+        "sae_dead_feature_fraction": dead_frac,
+        "sae_hidden_dim": int(all_features.shape[1]),
     }
 
 
@@ -98,8 +105,10 @@ def run_mechanistic_evaluation(
     tokenizer,
     num_classes: int,
     circuit_fraction: float = 0.1,
-    run_sae_comparison: bool = False,
+    run_sae_comparison: bool = True,
     centroid_tracker=None,
+    texts: list[str] | None = None,
+    max_length: int = 128,
 ) -> MechanisticResults:
     """Run the full mechanistic interpretability evaluation suite."""
     _model = unwrap_compiled(model)
@@ -118,7 +127,7 @@ def run_mechanistic_evaluation(
         batch_labels_t = torch.tensor(labels[start:end], device=DEVICE)
 
         with torch.inference_mode(), torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
-            sparse_seq, _ = _model(batch_ids, batch_mask)
+            sparse_seq, *_ = _model(batch_ids, batch_mask)
             logits, sparse_vector, W_eff, b_eff = _model.classify(sparse_seq, batch_mask)
 
         preds = logits.argmax(dim=-1)
@@ -207,7 +216,14 @@ def run_mechanistic_evaluation(
         model, input_ids_list, attention_mask_list, labels,
     )
 
-    # 8. SAE baseline comparison (optional)
+    # 8. Polysemy defense: Contextual Consistency Score
+    if texts is not None:
+        from splade.evaluation.polysemy import compute_contextual_consistency_score
+        results.polysemy_scores = compute_contextual_consistency_score(
+            model, tokenizer, texts, labels, max_length,
+        )
+
+    # 9. SAE baseline comparison (optional)
     if run_sae_comparison:
         results.sae_comparison = _run_sae_comparison(
             model, input_ids_list, attention_mask_list, labels, tokenizer,
@@ -263,5 +279,14 @@ def print_mechanistic_results(results: MechanisticResults) -> None:
             scores = circuit.attribution_scores[:5]
             token_strs = [f"{t}({s:.3f})" for t, s in zip(tokens, scores)]
             print(f"    Class {class_idx}: {', '.join(token_strs)}")
+
+    if results.polysemy_scores:
+        ps = results.polysemy_scores
+        print(f"\n[Polysemy Defense: Contextual Consistency Score]")
+        print(f"  Mean cross-context Jaccard: {ps['mean_jaccard']:.4f}")
+        print(f"  Words evaluated: {ps['num_words_evaluated']}")
+        if ps.get("per_word"):
+            for word, info in sorted(ps["per_word"].items(), key=lambda x: x[1]["jaccard"]):
+                print(f"    {word:<12} Jaccard={info['jaccard']:.4f}  pairs={info['n_pairs']}  n={info['n_occurrences']}")
 
     print("\n" + "=" * 80)

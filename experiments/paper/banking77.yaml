@@ -1,5 +1,5 @@
-experiment_name: "mechanistic_banking77"
-output_dir: "results/mechanistic/base"
+experiment_name: "paper_banking77"
+output_dir: "results/paper/banking77"
 
 data:
   dataset_name: "banking77"

@@ -1,0 +1,10 @@
+experiment_name: "surgery_beavertails"
+output_dir: "results/surgery_beavertails"
+
+data:
+  dataset_name: "beavertails"
+  train_samples: 10000
+  test_samples: 2000
+
+model:
+  name: "answerdotai/ModernBERT-base"

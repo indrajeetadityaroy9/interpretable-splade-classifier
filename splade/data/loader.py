@@ -5,12 +5,11 @@ from datasets import load_dataset
 
 
 _DATASETS = {
-    "sst2": {"path": "glue", "name": "sst2", "text_col": "sentence", "test_split": "validation", "num_labels": 2},
-    "ag_news": {"path": "ag_news", "name": None, "text_col": "text", "test_split": "test", "num_labels": 4},
     "imdb": {"path": "imdb", "name": None, "text_col": "text", "test_split": "test", "num_labels": 2},
     "yelp": {"path": "yelp_polarity", "name": None, "text_col": "text", "test_split": "test", "num_labels": 2},
-    "esnli": {"path": "esnli", "name": None, "text_cols": ["premise", "hypothesis"], "test_split": "test", "num_labels": 3},
     "civilcomments": {"path": "google/civil_comments", "name": None, "text_col": "text", "label_col": "toxicity", "label_threshold": 0.5, "test_split": "test", "num_labels": 2},
+    "banking77": {"path": "PolyAI/banking77", "name": None, "text_col": "text", "test_split": "test", "num_labels": 77},
+    "beavertails": {"path": "PKU-Alignment/BeaverTails", "name": "30k", "text_cols": ["prompt", "response"], "label_col": "is_safe", "label_invert": True, "test_split": "test", "num_labels": 2},
 }
 
 # Identity columns in CivilComments for bias analysis
@@ -21,6 +20,24 @@ CIVILCOMMENTS_IDENTITY_COLS = [
     "black", "white", "asian", "latino", "other_race_or_ethnicity",
     "physical_disability", "intellectual_or_learning_disability",
     "psychiatric_or_mental_illness", "other_disability",
+]
+
+# Harm categories in BeaverTails for disentangled surgery
+BEAVERTAILS_HARM_CATEGORIES = [
+    "animal_abuse",
+    "child_abuse",
+    "controversial_topics,politics",
+    "discrimination,stereotype,injustice",
+    "drug_abuse,weapons,banned_substance",
+    "financial_crime,property_crime,theft",
+    "hate_speech,offensive_language",
+    "misinformation_regarding_ethics,laws_and_safety",
+    "non_violent_unethical_behavior",
+    "privacy_violation",
+    "self_harm",
+    "sexually_explicit,adult_content",
+    "terrorism,organized_crime",
+    "violence,aiding_and_abetting,incitement",
 ]
 
 
@@ -62,6 +79,8 @@ def _load_split(cfg: dict, split: str, max_samples: int, seed: int) -> tuple[lis
     threshold = cfg.get("label_threshold")
     if threshold is not None:
         labels = [int(float(row[label_col]) >= threshold) for row in dataset]
+    elif cfg.get("label_invert"):
+        labels = [int(not bool(row[label_col])) for row in dataset]
     else:
         labels = [int(label) for label in dataset[label_col]]
     return _shuffle_and_truncate(texts, labels, max_samples, seed)
@@ -116,3 +135,45 @@ def load_civilcomments_with_identity(
     train_texts, train_labels, train_ids = _load_with_identity("train", train_samples)
     test_texts, test_labels, test_ids = _load_with_identity(cfg["test_split"], test_samples)
     return train_texts, train_labels, test_texts, test_labels, cfg["num_labels"], train_ids, test_ids
+
+
+def load_beavertails_with_categories(
+    train_samples: int = -1,
+    test_samples: int = -1,
+    seed: int = 42,
+) -> tuple[list[str], list[int], list[str], list[int], int, list[dict[str, bool]], list[dict[str, bool]]]:
+    """Load BeaverTails with per-example harm category annotations for disentangled surgery.
+
+    Returns:
+        train_texts, train_labels, test_texts, test_labels, num_labels,
+        train_categories, test_categories
+        where each category dict maps harm category name -> bool.
+        Labels are inverted: is_safe=True -> 0 (safe), is_safe=False -> 1 (unsafe).
+    """
+    cfg = _DATASETS["beavertails"]
+
+    def _load_with_categories(split, max_samples):
+        dataset = load_dataset(cfg["path"], cfg["name"], split=split)
+        cols = cfg["text_cols"]
+        texts = [f"{row[cols[0]]} [SEP] {row[cols[1]]}" for row in dataset]
+        labels = [int(not bool(row[cfg["label_col"]])) for row in dataset]
+        categories = []
+        for row in dataset:
+            raw_cats = row.get("category", {})
+            if isinstance(raw_cats, dict):
+                cat_dict = {k: bool(raw_cats.get(k, False)) for k in BEAVERTAILS_HARM_CATEGORIES}
+            elif isinstance(raw_cats, (list, set)):
+                cat_dict = {k: (k in raw_cats) for k in BEAVERTAILS_HARM_CATEGORIES}
+            else:
+                cat_dict = {k: False for k in BEAVERTAILS_HARM_CATEGORIES}
+            categories.append(cat_dict)
+        combined = list(zip(texts, labels, categories))
+        random.Random(seed).shuffle(combined)
+        if max_samples > 0:
+            combined = combined[:max_samples]
+        t, l, c = zip(*combined) if combined else ([], [], [])
+        return list(t), list(l), list(c)
+
+    train_texts, train_labels, train_cats = _load_with_categories("train", train_samples)
+    test_texts, test_labels, test_cats = _load_with_categories(cfg["test_split"], test_samples)
+    return train_texts, train_labels, test_texts, test_labels, cfg["num_labels"], train_cats, test_cats

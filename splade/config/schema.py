@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 
 @dataclass
 class DataConfig:
-    dataset_name: str = "sst2"
+    dataset_name: str = "banking77"
     train_samples: int = -1  # -1 = use full split
     test_samples: int = -1   # -1 = use full split
 
@@ -15,20 +15,17 @@ class ModelConfig:
 
 @dataclass
 class TrainingConfig:
-    target_accuracy: float | None = None  # GECO tau override; None = auto from warmup
-    sparsity_target: float = 0.1          # circuit_fraction (top k% of active dims)
-    warmup_fraction: float = 0.2          # fraction of training for CE-only warmup
+    sparsity_target: float = 0.1
+    warmup_fraction: float = 0.2
+    pooling: str = "max"  # "max" or "attention"
+    learning_rate: float = 3e-4  # Schedule-Free AdamW base LR
 
 
 @dataclass
-class MechanisticConfig:
-    circuit_fraction: float = 0.1
-    sae_comparison: bool = False
-
-
-@dataclass
-class EvaluationConfig:
-    seeds: list[int] = field(default_factory=lambda: [42])
+class VPEConfig:
+    enabled: bool = False
+    token_ids: list[int] = field(default_factory=list)
+    num_senses: int = 4
 
 
 @dataclass
@@ -37,6 +34,6 @@ class Config:
     output_dir: str
     data: DataConfig
     model: ModelConfig
-    evaluation: EvaluationConfig
-    mechanistic: MechanisticConfig = field(default_factory=MechanisticConfig)
+    seed: int = 42
     training: TrainingConfig = field(default_factory=TrainingConfig)
+    vpe: VPEConfig = field(default_factory=VPEConfig)

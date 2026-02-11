@@ -1,18 +1,17 @@
-# Classifier MLP (architecture, not hyperparameter)
+# Architecture (not hyperparameters)
 CLASSIFIER_HIDDEN = 256
 
-# Training loop ceilings and standard regularization
+# Training loop bounds
 MAX_EPOCHS = 50
 EARLY_STOP_PATIENCE = 10
-WARMUP_RATIO = 0.06
-WEIGHT_DECAY = 0.01
+
+# Regularization (established defaults, Müller et al. 2019)
 LABEL_SMOOTHING = 0.1
-EMA_DECAY = 0.999
 
-# LR range test (already adaptive)
-LR_FIND_STEPS = 100
-LR_FIND_END = 1e-2
-LR_FIND_DIVERGE_FACTOR = 4.0
+# JumpReLU STE bandwidth (Rajamanoharan et al. 2024, paper-specified)
+# Controls sharpness of the sigmoid approximation to Heaviside in the backward pass.
+# Smaller = sharper (closer to true Heaviside) but noisier gradients.
+JUMPRELU_BANDWIDTH = 0.001
 
-# CIS circuit losses (internal)
+# Circuit loss internals
 CIRCUIT_TEMPERATURE = 10.0

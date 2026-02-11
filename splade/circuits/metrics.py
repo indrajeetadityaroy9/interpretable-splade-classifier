@@ -14,6 +14,24 @@ from splade.mechanistic.attribution import compute_attribution_tensor
 from splade.utils.cuda import COMPUTE_DTYPE, DEVICE, unwrap_compiled
 
 
+def _id_to_name(tid: int, tokenizer, model: torch.nn.Module) -> str:
+    """Map token/virtual-slot ID to a human-readable name."""
+    _orig = unwrap_compiled(model)
+    V = _orig.vocab_size
+    if tid < V:
+        return tokenizer.convert_ids_to_tokens([tid])[0]
+    if hasattr(_orig, 'virtual_expander') and _orig.virtual_expander is not None:
+        vpe = _orig.virtual_expander
+        offset = tid - V
+        M = vpe.num_senses - 1
+        parent_idx = offset // M
+        sense = offset % M + 1
+        parent_tid = vpe.token_ids[parent_idx]
+        parent_name = tokenizer.convert_ids_to_tokens([parent_tid])[0]
+        return f"{parent_name}@sense{sense}"
+    return f"[virtual_{tid}]"
+
+
 @dataclass
 class VocabularyCircuit:
     class_idx: int
@@ -44,7 +62,7 @@ def extract_vocabulary_circuit(
     if precomputed_attributions is not None:
         mean_attributions = precomputed_attributions
     else:
-        vocab_size = _model.vocab_size
+        vocab_size = _model.vocab_size_expanded
         token_attribution_sums = torch.zeros(vocab_size, device=DEVICE)
         n_examples = 0
         eval_batch = 32
@@ -56,7 +74,7 @@ def extract_vocabulary_circuit(
             bs = end - start
 
             with torch.inference_mode(), torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
-                sparse_seq, _ = _model(batch_ids, batch_mask)
+                sparse_seq, *_ = _model(batch_ids, batch_mask)
                 _, sparse_vector, W_eff, _ = _model.classify(sparse_seq, batch_mask)
 
             class_labels_t = torch.full((bs,), class_idx, device=DEVICE)
@@ -87,7 +105,7 @@ def extract_vocabulary_circuit(
     sorted_indices = torch.argsort(mean_attributions[circuit_token_ids], descending=True)
     circuit_token_ids = circuit_token_ids[sorted_indices].tolist()
 
-    token_names = tokenizer.convert_ids_to_tokens(circuit_token_ids)
+    token_names = [_id_to_name(tid, tokenizer, model) for tid in circuit_token_ids]
     scores = [float(mean_attributions[tid].item()) for tid in circuit_token_ids]
 
     return VocabularyCircuit(
@@ -137,7 +155,7 @@ def measure_circuit_completeness(
         batch_labels_t = torch.tensor(class_labels[start:end], device=DEVICE)
 
         with torch.inference_mode(), torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
-            sparse_seq, _ = _model(batch_ids, batch_mask)
+            sparse_seq, *_ = _model(batch_ids, batch_mask)
             original_sparse = _model.to_pooled(sparse_seq, batch_mask)
             patched_sparse = original_sparse.clone()
             patched_sparse[:, non_circuit_ids_t] = 0.0
@@ -189,7 +207,7 @@ def measure_separation_jaccard(
         batch_labels_t = torch.tensor(batch_labels_slice, device=DEVICE)
 
         with torch.inference_mode(), torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
-            sparse_seq, _ = _model(batch_ids, batch_mask)
+            sparse_seq, *_ = _model(batch_ids, batch_mask)
             _, sparse_vector, W_eff, _ = _model.classify(sparse_seq, batch_mask)
 
         attr = compute_attribution_tensor(sparse_vector, W_eff, batch_labels_t)
@@ -253,25 +271,3 @@ def measure_separation_jaccard(
     }
 
 
-def visualize_circuit(circuit: VocabularyCircuit) -> str:
-    """Generate a text visualization of a vocabulary circuit."""
-    max_tokens = 20
-    lines = [
-        f"Vocabulary Circuit for class {circuit.class_idx}",
-        f"  Tokens: {len(circuit.token_ids)}",
-        f"  Total attribution: {circuit.total_attribution:.4f}",
-        f"  Completeness: {circuit.completeness_score:.4f}",
-        "",
-        f"  {'Token':<20} {'Attribution':>12}",
-        f"  {'-'*20} {'-'*12}",
-    ]
-    for name, score in zip(
-        circuit.token_names[:max_tokens],
-        circuit.attribution_scores[:max_tokens],
-    ):
-        lines.append(f"  {name:<20} {score:>12.6f}")
-
-    if len(circuit.token_ids) > max_tokens:
-        lines.append(f"  ... and {len(circuit.token_ids) - max_tokens} more tokens")
-
-    return "\n".join(lines)

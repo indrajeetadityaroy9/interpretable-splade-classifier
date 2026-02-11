@@ -1,4 +1,4 @@
-"""Tests for splade.circuits module — core, geco, losses."""
+"""Tests for splade.circuits module — core, geco, losses, activation."""
 
 import math
 
@@ -198,36 +198,6 @@ class TestGECOController:
         assert geco.lambda_ce < 200  # bounded
 
 
-class TestHoyerSparsity:
-    def test_one_hot_is_maximally_sparse(self):
-        """Hoyer sparsity of a one-hot vector should be close to 1.0."""
-        from splade.circuits.losses import compute_sharpness_loss
-
-        n = 100
-        sparse = torch.zeros(1, n)
-        sparse[0, 0] = 1.0
-        w_eff = torch.eye(n).unsqueeze(0)  # identity, so attr = sparse
-        labels = torch.tensor([0])
-
-        loss = compute_sharpness_loss(sparse, w_eff, labels)
-        # Hoyer of one-hot ≈ 1.0, so loss = 1 - 1.0 ≈ 0.0
-        assert loss.item() < 0.05
-
-    def test_uniform_is_not_sparse(self):
-        """Hoyer sparsity of a uniform vector should be close to 0.0."""
-        from splade.circuits.losses import compute_sharpness_loss
-
-        n = 100
-        sparse = torch.ones(1, n)
-        # W_eff[b, c, j]: need W_eff[:, 0, :] = ones so attr = sparse * W_eff = ones
-        w_eff = torch.ones(1, 1, n)
-        labels = torch.tensor([0])
-
-        loss = compute_sharpness_loss(sparse, w_eff, labels)
-        # Hoyer of uniform ≈ 0.0, so loss = 1 - 0.0 ≈ 1.0
-        assert loss.item() > 0.9
-
-
 class TestGradientCentralization:
     def test_centralizes_weight_gradients(self):
         from splade.training.optim import _gradient_centralization
@@ -257,6 +227,192 @@ class TestGradientCentralization:
         _gradient_centralization(model)
         # Bias (1D) should be unchanged
         assert torch.equal(model.bias.grad, bias_grad_before)
+
+
+class TestJumpReLUGate:
+    def test_eval_produces_exact_zeros(self):
+        from splade.models.layers.activation import JumpReLUGate
+        gate = JumpReLUGate(dim=100, init_log_threshold=2.0)  # high threshold
+        gate.eval()
+        x = torch.randn(4, 100) * 0.1  # small values, below threshold
+        out, _, _ = gate(x)
+        assert (out == 0.0).sum() > 0
+
+    def test_train_produces_exact_binary_gates(self):
+        """JumpReLU should produce exactly {0, 1} gates during training."""
+        from splade.models.layers.activation import JumpReLUGate
+        gate = JumpReLUGate(dim=100, init_log_threshold=0.0)
+        gate.train()
+        x = torch.randn(4, 100) * 3.0
+        out, gate_mask, _ = gate(x)
+        # Gate values should be exactly 0.0 or 1.0
+        assert ((gate_mask == 0.0) | (gate_mask == 1.0)).all(), \
+            f"Gate has non-binary values: {gate_mask.unique()}"
+
+    def test_train_produces_values(self):
+        from splade.models.layers.activation import JumpReLUGate
+        gate = JumpReLUGate(dim=100, init_log_threshold=-2.0)  # low threshold
+        gate.train()
+        x = torch.ones(4, 100) * 2.0
+        out, _, _ = gate(x)
+        assert out.shape == (4, 100)
+        # With low threshold and large input, most should be active
+        assert (out > 0).float().mean() > 0.5
+
+    def test_l0_probs_between_0_and_1(self):
+        from splade.models.layers.activation import JumpReLUGate
+        gate = JumpReLUGate(dim=100)
+        x = torch.randn(4, 100)
+        _, _, l0_probs = gate(x)
+        assert (l0_probs >= 0).all() and (l0_probs <= 1).all()
+
+    def test_3_tuple_return(self):
+        from splade.models.layers.activation import JumpReLUGate
+        gate = JumpReLUGate(dim=50)
+        x = torch.randn(4, 50)
+        result = gate(x)
+        assert len(result) == 3
+
+    def test_log_threshold_in_state_dict(self):
+        from splade.models.layers.activation import JumpReLUGate
+        gate = JumpReLUGate(dim=50)
+        sd = gate.state_dict()
+        assert "log_threshold" in sd
+
+    def test_ste_gradient_flows_to_threshold(self):
+        """Verify STE provides gradient to log_threshold."""
+        from splade.models.layers.activation import JumpReLUGate
+        gate = JumpReLUGate(dim=10, init_log_threshold=0.0)
+        gate.train()
+        x = torch.randn(8, 10) * 2.0
+        out, _, l0_probs = gate(x)
+        loss = out.sum() + l0_probs.sum()
+        loss.backward()
+        assert gate.log_threshold.grad is not None
+        assert gate.log_threshold.grad.abs().sum() > 0
+
+    def test_dla_identity_exact_during_training(self):
+        """Gate outputs should be exactly binary, making DLA exact in train mode."""
+        from splade.models.layers.activation import JumpReLUGate
+        gate = JumpReLUGate(dim=50, init_log_threshold=0.0)
+        gate.train()
+        x = torch.randn(16, 50) * 2.0
+        out, gate_mask, _ = gate(x)
+
+        # Verify: output == relu(x) * gate_mask exactly
+        z = torch.relu(x)
+        reconstructed = z * gate_mask
+        assert torch.allclose(out, reconstructed, atol=1e-6)
+
+
+class TestFeatureFrequencyTracker:
+    def test_frequency_updates(self):
+        from splade.circuits.losses import FeatureFrequencyTracker
+        tracker = FeatureFrequencyTracker(num_features=100, target_sparsity=0.1)
+        gate = torch.zeros(4, 100)
+        gate[:, :50] = 1.0
+        for _ in range(10):
+            tracker.update(gate)
+        # Features 0-49 should have high frequency, 50-99 should be ~0
+        assert tracker.freq_ema[:50].mean() > 0.1
+        assert tracker.freq_ema[50:].mean() < 0.01
+
+    def test_step_counter(self):
+        from splade.circuits.losses import FeatureFrequencyTracker
+        tracker = FeatureFrequencyTracker(num_features=50, target_sparsity=0.1)
+        gate = torch.ones(2, 50)
+        for _ in range(5):
+            tracker.update(gate)
+        assert tracker._step == 5
+
+
+class TestComputeFrequencyPenalty:
+    def test_returns_zero_before_warmup(self):
+        from splade.circuits.losses import FeatureFrequencyTracker, compute_frequency_penalty
+        from splade.models.layers.activation import JumpReLUGate
+        tracker = FeatureFrequencyTracker(num_features=50, target_sparsity=0.1)
+        activation = JumpReLUGate(dim=50)
+        # Before 50 steps, should return 0
+        loss = compute_frequency_penalty(tracker, activation)
+        assert loss.item() == 0.0
+
+    def test_penalizes_under_active_features(self):
+        from splade.circuits.losses import FeatureFrequencyTracker, compute_frequency_penalty
+        from splade.models.layers.activation import JumpReLUGate
+        tracker = FeatureFrequencyTracker(num_features=10, target_sparsity=0.1)
+        # Simulate enough steps with only features 0-4 active
+        for _ in range(60):
+            gate = torch.zeros(2, 10)
+            gate[:, :5] = 1.0
+            tracker.update(gate)
+        activation = JumpReLUGate(dim=10)
+        with torch.no_grad():
+            activation.log_threshold[5:] = 5.0
+        loss = compute_frequency_penalty(tracker, activation)
+        assert loss.item() > 0.0, "Should penalize under-active features"
+        loss.backward()
+        assert activation.log_threshold.grad is not None
+        assert activation.log_threshold.grad[5:].abs().sum() > 0.0
+
+
+class TestContrastiveSeparationLoss:
+    def test_zero_loss_when_well_separated(self):
+        from splade.circuits.losses import AttributionCentroidTracker, compute_separation_loss
+        tracker = AttributionCentroidTracker(num_classes=2, vocab_size=10)
+        # Set up well-separated centroids
+        tracker.centroids[0] = torch.tensor([1, 1, 0, 0, 0, 0, 0, 0, 0, 0], dtype=torch.float)
+        tracker.centroids[1] = torch.tensor([0, 0, 0, 0, 0, 0, 0, 0, 1, 1], dtype=torch.float)
+        tracker._initialized[:] = True
+        # Without per-sample data, falls back to centroid cosine
+        loss = compute_separation_loss(tracker)
+        # Orthogonal centroids → cosine = 0
+        assert loss.item() < 0.01
+
+    def test_high_loss_when_overlapping(self):
+        from splade.circuits.losses import AttributionCentroidTracker, compute_separation_loss
+        tracker = AttributionCentroidTracker(num_classes=2, vocab_size=10)
+        # Nearly identical centroids
+        tracker.centroids[0] = torch.ones(10)
+        tracker.centroids[1] = torch.ones(10) * 0.99
+        tracker._initialized[:] = True
+        loss = compute_separation_loss(tracker)
+        assert loss.item() > 0.9
+
+    def test_returns_zero_with_single_class(self):
+        from splade.circuits.losses import AttributionCentroidTracker, compute_separation_loss
+        tracker = AttributionCentroidTracker(num_classes=3, vocab_size=10)
+        tracker.centroids[0] = torch.ones(10)
+        tracker._initialized[0] = True
+        loss = compute_separation_loss(tracker)
+        assert loss.item() == 0.0
+
+
+class TestKLCompletenessLoss:
+    def test_kl_loss_is_non_negative(self):
+        from splade.circuits.losses import compute_completeness_loss
+        sparse = torch.randn(4, 100).abs()
+        W_eff = torch.randn(4, 3, 100)
+        labels = torch.tensor([0, 1, 2, 0])
+        classifier_fn = torch.nn.Linear(100, 3)
+        loss = compute_completeness_loss(
+            sparse, W_eff, labels, classifier_fn,
+            circuit_fraction=0.1,
+        )
+        assert loss.item() >= -1e-6  # KL divergence is non-negative
+
+    def test_kl_loss_with_precomputed_logits(self):
+        from splade.circuits.losses import compute_completeness_loss
+        sparse = torch.randn(4, 100).abs()
+        W_eff = torch.randn(4, 3, 100)
+        labels = torch.tensor([0, 1, 2, 0])
+        classifier_fn = torch.nn.Linear(100, 3)
+        full_logits = classifier_fn(sparse)
+        loss = compute_completeness_loss(
+            sparse, W_eff, labels, classifier_fn,
+            circuit_fraction=0.1,
+            full_logits=full_logits,
+        )
+        assert loss.item() >= -1e-6
 
 
 class TestRemovedConstants:
@@ -296,3 +452,20 @@ class TestRemovedConstants:
         from splade.training import constants
         assert not hasattr(constants, "CIRCUIT_FRACTION")
         assert not hasattr(constants, "CIRCUIT_WARMUP_FRACTION")
+
+    def test_jumprelu_bandwidth_exists(self):
+        from splade.training import constants
+        assert hasattr(constants, "JUMPRELU_BANDWIDTH")
+        assert constants.JUMPRELU_BANDWIDTH > 0
+
+    def test_removed_adaptive_constants(self):
+        """Verify constants eliminated by adaptive mechanisms are gone."""
+        from splade.training import constants
+        assert not hasattr(constants, "DEAD_FEATURE_WINDOW")
+        assert not hasattr(constants, "AUXK_COEFF")
+        assert not hasattr(constants, "WEIGHT_DECAY")
+        assert not hasattr(constants, "EMA_DECAY")
+        assert not hasattr(constants, "WARMUP_RATIO")
+        assert not hasattr(constants, "LR_FIND_STEPS")
+        assert not hasattr(constants, "LR_FIND_END")
+        assert not hasattr(constants, "LR_FIND_DIVERGE_FACTOR")

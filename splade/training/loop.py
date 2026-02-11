@@ -10,60 +10,24 @@ from splade.data.loader import infer_max_length
 from splade.circuits.geco import GECOController
 from splade.circuits.losses import (
     AttributionCentroidTracker,
+    FeatureFrequencyTracker,
     compute_completeness_loss,
+    compute_frequency_penalty,
     compute_gate_sparsity_loss,
     compute_separation_loss,
 )
 from splade.training.constants import (
     EARLY_STOP_PATIENCE,
-    EMA_DECAY,
     LABEL_SMOOTHING,
     MAX_EPOCHS,
-    WARMUP_RATIO,
 )
 from splade.training.optim import (_gradient_centralization,
                                    _build_param_groups,
-                                   _infer_batch_size, _LRScheduler, find_lr)
+                                   _infer_batch_size, build_optimizer)
 from splade.utils.cuda import COMPUTE_DTYPE, DEVICE, unwrap_compiled
 
 _NUM_WORKERS = min(os.cpu_count() or 4, 16)
 _PREFETCH_FACTOR = 4
-
-
-class ModelEMA:
-    def __init__(self, model: torch.nn.Module, decay: float = EMA_DECAY):
-        self.decay = decay
-        self.shadow: dict[str, torch.Tensor] = {}
-        self._backup: dict[str, torch.Tensor] = {}
-        _orig = unwrap_compiled(model)
-        for name, param in _orig.named_parameters():
-            if param.requires_grad:
-                self.shadow[name] = param.data.clone()
-
-    @torch.no_grad()
-    def update(self, model: torch.nn.Module) -> None:
-        _orig = unwrap_compiled(model)
-        for name, param in _orig.named_parameters():
-            if param.requires_grad and name in self.shadow:
-                self.shadow[name].lerp_(param.data, 1.0 - self.decay)
-
-    def apply_shadow(self, model: torch.nn.Module) -> None:
-        _orig = unwrap_compiled(model)
-        self._backup.clear()
-        for name, param in _orig.named_parameters():
-            if name in self.shadow:
-                self._backup[name] = param.data.clone()
-                param.data.copy_(self.shadow[name])
-
-    def restore(self, model: torch.nn.Module) -> None:
-        _orig = unwrap_compiled(model)
-        for name, param in _orig.named_parameters():
-            if name in self._backup:
-                param.data.copy_(self._backup[name])
-        self._backup.clear()
-
-    def state_dict(self) -> dict[str, torch.Tensor]:
-        return {k: v.clone() for k, v in self.shadow.items()}
 
 
 def train_model(
@@ -77,9 +41,9 @@ def train_model(
     val_labels: list[int],
     max_length: int | None = None,
     batch_size: int | None = None,
-    target_accuracy: float | None = None,
     sparsity_target: float = 0.1,
     warmup_fraction: float = 0.2,
+    learning_rate: float = 3e-4,
 ) -> "AttributionCentroidTracker":
     if max_length is None:
         max_length = infer_max_length(texts, tokenizer, model_name=model_name)
@@ -109,20 +73,11 @@ def train_model(
         persistent_workers=True,
     )
 
-    optimal_lr = find_lr(model, loader, num_labels)
-    print(f"LR range test -> optimal_lr={optimal_lr:.2e}")
-
-    param_groups = _build_param_groups(model, optimal_lr)
-    optimizer = torch.optim.AdamW(param_groups, fused=True)
-
     steps_per_epoch = -(-len(texts) // batch_size)
     total_steps = steps_per_epoch * MAX_EPOCHS
-    warmup_steps = max(1, int(WARMUP_RATIO * total_steps))
-
-    lr_scheduler = _LRScheduler(optimal_lr, total_steps, warmup_steps)
 
     _orig = unwrap_compiled(model)
-    vocab_size = _orig.vocab_size
+    vocab_size = _orig.vocab_size_expanded
     classifier_params = set(_orig.classifier_parameters())
 
     criterion = (
@@ -131,15 +86,25 @@ def train_model(
         else torch.nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
     )
 
-    ema = ModelEMA(model, decay=EMA_DECAY)
-
     # CIS circuit losses with GECO adaptive weighting
     centroid_tracker = AttributionCentroidTracker(
         num_classes=num_labels, vocab_size=vocab_size,
+    ).to(DEVICE)
+
+    # Schedule-Free AdamW: subsumes LR scheduling, warmup, and model EMA
+    # Build optimizer after centroid_tracker so its learned margin is included
+    optimizer = build_optimizer(model, base_lr=learning_rate)
+    # Add centroid_tracker's learned margin to the optimizer
+    optimizer.add_param_group({
+        "params": [centroid_tracker.log_margin],
+        "lr": learning_rate,
+        "weight_decay": 0.0,
+    })
+    print(f"Schedule-Free AdamW: lr={learning_rate:.2e}")
+    freq_tracker = FeatureFrequencyTracker(
+        num_features=vocab_size, target_sparsity=sparsity_target,
     )
     geco = GECOController(steps_per_epoch=steps_per_epoch)
-    if target_accuracy is not None:
-        geco.tau_ce = target_accuracy
     circuit_delay_steps = int(warmup_fraction * total_steps)
     patience_reset_step = int(warmup_fraction * total_steps)
     patience_was_reset = False
@@ -162,9 +127,10 @@ def train_model(
 
     best_val_loss = float("inf")
     patience_counter = 0
-    best_ema_state: dict[str, torch.Tensor] | None = None
+    best_state: dict[str, torch.Tensor] | None = None
 
     model.train()
+    optimizer.train()
     for epoch_index in range(MAX_EPOCHS):
         total_loss = torch.zeros(1, device=DEVICE)
         batch_count = 0
@@ -174,14 +140,10 @@ def train_model(
             batch_mask = batch_mask.to(DEVICE, non_blocking=True)
             batch_labels = batch_labels.to(DEVICE, non_blocking=True)
 
-            learning_rate = lr_scheduler.step()
-            for parameter_group in optimizer.param_groups:
-                parameter_group["lr"] = learning_rate
-
             optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
-                sparse_seq, gate_probs = model(batch_ids, batch_mask)
+                sparse_seq, gate_mask, l0_probs = model(batch_ids, batch_mask)
                 logits, sparse, W_eff, _ = _orig.classify(sparse_seq, batch_mask)
                 classification_loss = (
                     criterion(logits.squeeze(-1), batch_labels)
@@ -191,6 +153,9 @@ def train_model(
 
                 global_step += 1
 
+                # Update feature frequency tracker every step
+                freq_tracker.update(gate_mask.detach())
+
                 # Reset patience at fixed point for both baseline and CIS
                 if not patience_was_reset and global_step >= patience_reset_step:
                     patience_was_reset = True
@@ -199,26 +164,31 @@ def train_model(
                 if global_step < circuit_delay_steps:
                     # Warmup: CE only, record CE for GECO tau
                     loss = classification_loss
-                    if target_accuracy is None:
-                        geco.record_warmup_ce(classification_loss.detach().item())
+                    geco.record_warmup_ce(classification_loss.detach().item())
                 else:
                     if not warmup_finalized:
-                        if target_accuracy is None:
-                            tau = geco.finalize_warmup()
-                            print(f"GECO: tau_ce={tau:.4f}")
-                        else:
-                            print(f"GECO: tau_ce={target_accuracy:.4f} (from config)")
+                        tau = geco.finalize_warmup()
+                        print(f"GECO: tau_ce={tau:.4f}")
                         warmup_finalized = True
 
                     cc_loss = compute_completeness_loss(
                         sparse, W_eff, batch_labels.view(-1),
                         _orig.classifier_logits_only,
                         circuit_fraction=sparsity_target,
+                        full_logits=logits,
                     )
-                    sep_loss = compute_separation_loss(centroid_tracker)
-                    gate_loss = compute_gate_sparsity_loss(gate_probs)
+                    sep_loss = compute_separation_loss(
+                        centroid_tracker,
+                        sparse_vector=sparse,
+                        W_eff=W_eff,
+                        labels=batch_labels.view(-1),
+                    )
+                    gate_loss = compute_gate_sparsity_loss(l0_probs)
+                    freq_loss = compute_frequency_penalty(
+                        freq_tracker, _orig.activation,
+                    )
 
-                    circuit_objective = cc_loss + sep_loss + gate_loss
+                    circuit_objective = cc_loss + sep_loss + gate_loss + freq_loss
                     loss = geco.compute_loss(classification_loss, circuit_objective)
 
                     centroid_tracker.update(
@@ -230,8 +200,6 @@ def train_model(
             _gradient_centralization(model, skip_params=classifier_params)
             optimizer.step()
 
-            ema.update(model)
-
             total_loss += loss.detach()
             batch_count += 1
 
@@ -240,6 +208,11 @@ def train_model(
 
         if warmup_finalized:
             epoch_msg += f", GECO lambda={geco.lambda_ce:.4f}"
+            under_active_frac = float(
+                (freq_tracker.freq_ema < freq_tracker.target_freq * 0.1).float().mean().item()
+            ) if freq_tracker._step >= 50 else 0.0
+            if under_active_frac > 0:
+                epoch_msg += f", under-active={under_active_frac:.1%}"
             if abs(geco._log_lambda) >= 4.9:
                 print(
                     f"\n  [WARNING] GECO lambda pinned at {geco.lambda_ce:.2f} "
@@ -250,11 +223,12 @@ def train_model(
         else:
             epoch_msg += ", GECO: warming up"
 
-        ema.apply_shadow(model)
+        # Switch to averaged params for validation
+        optimizer.eval()
         model.eval()
         with torch.inference_mode():
             with torch.amp.autocast("cuda", dtype=COMPUTE_DTYPE):
-                val_sparse_seq, _ = model(val_ids_gpu, val_mask_gpu)
+                val_sparse_seq, *_ = model(val_ids_gpu, val_mask_gpu)
                 val_logits = _orig.classify(val_sparse_seq, val_mask_gpu).logits
                 val_loss = (
                     criterion(val_logits.squeeze(-1), val_label_gpu)
@@ -262,15 +236,21 @@ def train_model(
                     else criterion(val_logits, val_label_gpu.view(-1))
                 )
         val_loss_val = val_loss.item()
-        epoch_msg += f", Val Loss (EMA): {val_loss_val:.4f}"
+        epoch_msg += f", Val Loss: {val_loss_val:.4f}"
 
-        ema.restore(model)
+        # Switch back to training params
+        optimizer.train()
         model.train()
 
         if val_loss_val < best_val_loss:
             best_val_loss = val_loss_val
             patience_counter = 0
-            best_ema_state = ema.state_dict()
+            # Save averaged params (currently active via optimizer.eval() -> optimizer.train())
+            best_state = {
+                name: param.data.clone()
+                for name, param in unwrap_compiled(model).named_parameters()
+                if param.requires_grad
+            }
         else:
             patience_counter += 1
 
@@ -281,11 +261,15 @@ def train_model(
 
         print(epoch_msg)
 
-    _orig_model = unwrap_compiled(model)
-    for name, param in _orig_model.named_parameters():
-        if name in best_ema_state:
-            param.data.copy_(best_ema_state[name])
-    print(f"Applied best EMA weights (val loss: {best_val_loss:.4f})")
+    # Restore best averaged weights
+    if best_state is not None:
+        # Switch to eval mode to get averaged params, then overwrite with best
+        optimizer.eval()
+        _orig_model = unwrap_compiled(model)
+        for name, param in _orig_model.named_parameters():
+            if name in best_state:
+                param.data.copy_(best_state[name])
+        print(f"Applied best weights (val loss: {best_val_loss:.4f})")
 
     model.eval()
 
