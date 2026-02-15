@@ -3,7 +3,7 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "interpretable-splade-classifier"
+name = "lexical-sae"
 version = "2.0.0"
 requires-python = ">=3.10"
 dependencies = [
@@ -22,8 +22,21 @@ dependencies = [
     "tqdm~=4.67.0",
 ]
 
+[project.scripts]
+lexical-sae = "lexical_sae.scripts.run:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.8"]
+
 [tool.pytest.ini_options]
 markers = ["slow: tests requiring network access (deselect with '-k not slow')"]
 
 [tool.setuptools.packages.find]
-include = ["splade*"]
+include = ["lexical_sae*"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]

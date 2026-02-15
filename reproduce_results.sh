@@ -2,35 +2,28 @@
 set -e
 
 echo "============================================"
-echo "Circuit-Integrated SPLADE (CIS) — Reproduction Pipeline"
+echo "Lexical-SAE — Reproduction Pipeline"
 echo "============================================"
 
-# 1. Main Benchmarks
-echo "Running CIS Main Benchmarks..."
-for config in experiments/main/*.yaml; do
-    echo "Running $config"
-    python -m splade.scripts.run_experiment --config "$config"
-done
+RUNNER="python -m lexical_sae.scripts.run"
 
-# 2. Dataset Experiments
-echo "Running CIS Dataset Experiments..."
-for config in experiments/datasets/*.yaml; do
-    echo "Running $config"
-    python -m splade.scripts.run_experiment --config "$config"
-done
+# Core experiments
+$RUNNER --config experiments/core/banking77.yaml
+$RUNNER --config experiments/core/imdb.yaml
+$RUNNER --config experiments/core/yelp.yaml
 
-# 3. Ablations
-echo "Running CIS Ablations..."
-for config in experiments/ablation/*.yaml; do
-    echo "Running $config"
-    python -m splade.scripts.run_ablation --config "$config"
-done
+# Ablations
+$RUNNER --config experiments/ablation/banking77_ablation.yaml
+$RUNNER --config experiments/ablation/imdb_ablation.yaml
 
-# 4. Mechanistic Evaluation
-echo "Running Mechanistic Evaluation..."
-for config in experiments/mechanistic/*.yaml; do
-    echo "Running $config"
-    python -m splade.scripts.run_experiment --config "$config"
-done
+# SOTA comparison (experiment + dense baseline)
+$RUNNER --config experiments/analysis/banking77_sota.yaml
 
-echo "Reproduction Complete. Results are in results/"
+# Surgical bias removal
+$RUNNER --config experiments/surgery/civilcomments_surgery.yaml
+$RUNNER --config experiments/surgery/beavertails_surgery.yaml
+
+# Long-context needle-in-haystack
+$RUNNER --config experiments/analysis/imdb_long_context.yaml
+
+echo "Done."

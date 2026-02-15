@@ -78,25 +78,25 @@ Requires Python ≥ 3.10, PyTorch ≥ 2.4.0, and a CUDA-enabled GPU.
 ### Classification (train + mechanistic evaluation)
 
 ```bash
-python -m splade.scripts.run_experiment --config experiments/paper/imdb.yaml
+lexical-sae --config experiments/imdb.yaml
 ```
 
 ### Surgical Concept Removal
 
 ```bash
-python -m splade.scripts.run_surgery --config experiments/surgery.yaml
+lexical-sae --config experiments/civilcomments_surgery.yaml
 ```
 
 ### Ablation Studies
 
 ```bash
-python -m splade.scripts.run_ablation --config experiments/ablation/ablation.yaml
+lexical-sae --config experiments/imdb_ablation.yaml
 ```
 
-### Faithfulness Benchmark
+### Long-Context Evaluation
 
 ```bash
-python -m splade.scripts.run_faithfulness --config experiments/verify.yaml
+lexical-sae --config experiments/imdb_long_context.yaml
 ```
 
 ### Configuration
@@ -118,66 +118,11 @@ model:
 training:
   sparsity_target: 0.1
   warmup_fraction: 0.2
-  pooling: "max"          # "max" or "attention"
-  learning_rate: 3e-4     # Schedule-Free AdamW base LR
+  pooling: "max"  # "max" or "attention"
+  learning_rate: 3e-4  # Schedule-Free AdamW base LR
 ```
 
 Supported datasets: `banking77`, `imdb`, `yelp`, `civilcomments`, `beavertails`.
-
-## Repository Structure
-
-```
-splade/
-├── models/
-│   ├── lexical_sae.py                 # LexicalSAE: backbone + JumpReLU + task head
-│   └── layers/
-│       ├── activation.py              # JumpReLUGate with sigmoid STE
-│       └── virtual_expander.py        # Virtual Polysemy Expansion (VPE)
-├── circuits/
-│   ├── core.py                        # CircuitState, circuit_mask()
-│   ├── losses.py                      # KL completeness, contrastive separation,
-│   │                                  #   gate sparsity, feature frequency penalty,
-│   │                                  #   AttributionCentroidTracker (learned margin),
-│   │                                  #   FeatureFrequencyTracker
-│   ├── geco.py                        # GECO constrained optimization controller
-│   └── metrics.py                     # Circuit extraction, completeness measurement
-├── training/
-│   ├── loop.py                        # Training loop (two-phase GECO)
-│   ├── optim.py                       # Schedule-Free AdamW, param groups,
-│   │                                  #   gradient centralization
-│   └── constants.py                   # Training hyperparameters
-├── mechanistic/
-│   ├── attribution.py                 # compute_attribution_tensor() — core DLA
-│   ├── sae.py                         # Post-hoc SAE baseline
-│   └── layerwise.py                   # Per-layer attribution analysis
-├── evaluation/
-│   ├── mechanistic.py                 # Full mechanistic evaluation pipeline
-│   ├── eraser.py                      # ERASER faithfulness metrics
-│   ├── leace.py                       # LEACE concept erasure baseline
-│   ├── compare_explainers.py          # Comparison with LIME, IG, Attention
-│   ├── baselines.py                   # Baseline accuracy scoring
-│   ├── dense_baseline.py              # Dense SAE comparison
-│   └── polysemy.py                    # VPE polysemy analysis
-├── data/
-│   └── loader.py                      # Dataset loading and preparation
-├── config/
-│   ├── schema.py                      # Dataclass configs (Data, Model, Training, VPE)
-│   └── load.py                        # YAML config loader
-├── scripts/
-│   ├── run_experiment.py              # Train + mechanistic evaluation
-│   ├── run_surgery.py                 # Surgical concept removal (bias)
-│   ├── run_ablation.py                # Circuit loss ablation studies
-│   ├── run_faithfulness.py            # ERASER faithfulness benchmark
-│   ├── run_multi_dataset.py           # Cross-dataset evaluation
-│   ├── run_long_context.py            # Extended sequence evaluation
-│   └── run_sota_comparison.py         # SOTA baseline comparison
-├── inference.py                       # Predict, explain, score utilities
-├── intervene.py                       # SuppressedModel, bias evaluation
-├── pipelines.py                       # Shared setup_and_train() pipeline
-└── utils/cuda.py                      # Device, dtype, seed management
-experiments/                           # YAML configs for all experiments
-tests/                                 # Unit tests
-```
 
 ## Comparison with Post-Hoc Sparse Autoencoders
 
