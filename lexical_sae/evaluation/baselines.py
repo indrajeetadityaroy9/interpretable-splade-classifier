@@ -203,9 +203,9 @@ def attention_attribution(
     return attn_sparse
 
 
-# ---------------------------------------------------------------------------
+
 # Explainer comparison (merged from compare_explainers.py)
-# ---------------------------------------------------------------------------
+
 
 _EXPLAINERS = {
     "dla": dla_attribution,

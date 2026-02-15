@@ -20,9 +20,9 @@ from lexical_sae.core.types import CircuitState
 from lexical_sae.core.constants import CLASSIFIER_HIDDEN, JUMPRELU_BANDWIDTH
 
 
-# ---------------------------------------------------------------------------
+
 # JumpReLU gate (Rajamanoharan et al. 2024)
-# ---------------------------------------------------------------------------
+
 
 class _JumpReLUSTE(torch.autograd.Function):
     """JumpReLU with sigmoid straight-through estimator.
@@ -92,9 +92,9 @@ class JumpReLUGate(torch.nn.Module):
         return output, gate, l0_probs
 
 
-# ---------------------------------------------------------------------------
+
 # Virtual Polysemy Expansion (VPE)
-# ---------------------------------------------------------------------------
+
 
 class VirtualExpander(torch.nn.Module):
     """Expands polysemous tokens into multiple virtual sense slots.
@@ -156,9 +156,9 @@ class VirtualExpander(torch.nn.Module):
         return torch.cat([mlm_logits_expanded, virtual_logits], dim=-1)
 
 
-# ---------------------------------------------------------------------------
+
 # Pooling
-# ---------------------------------------------------------------------------
+
 
 class AttentionPool(torch.nn.Module):
     """Learned attention-weighted pooling over sequence positions."""
@@ -176,9 +176,9 @@ class AttentionPool(torch.nn.Module):
         return (sparse_seq * weights.unsqueeze(-1)).sum(dim=1)  # [B, V]
 
 
-# ---------------------------------------------------------------------------
+
 # Main model
-# ---------------------------------------------------------------------------
+
 
 class LexicalSAE(torch.nn.Module):
     """Lexical Sparse Autoencoder for interpretable classification.
