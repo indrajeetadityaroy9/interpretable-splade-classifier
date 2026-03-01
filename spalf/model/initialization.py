@@ -8,7 +8,8 @@ from torch import Tensor
 from spalf.model.sae import StratifiedSAE
 from spalf.whitening.whitener import SoftZCAWhitener
 
-TYPE_CHECKING = False
+from typing import TYPE_CHECKING
+
 if TYPE_CHECKING:
     from spalf.config import CalibrationResult
     from spalf.data.activation_store import ActivationStore
@@ -42,8 +43,7 @@ def initialize_sae(
                 W_enc_A[j] = (whitener.inverse(col) - whitener.mean).squeeze(0)
             sae.W_enc.data[:V] = W_enc_A
         else:
-            W_white_inv = whitener.W_white_inv
-            sae.W_enc.data[:V] = (W_white_inv @ W_vocab).T
+            sae.W_enc.data[:V] = (whitener._W_white_inv @ W_vocab).T
 
         W_enc_A = sae.W_enc.data[:V]
         W_enc_B = torch.randn(sae.F_free, d, device=device) / (d**0.5)

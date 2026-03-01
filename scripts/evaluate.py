@@ -39,6 +39,10 @@ def run_eval(config: SPALFConfig) -> dict:
 
     sae, whitener, W_vocab = load_checkpoint(config.checkpoint)
 
+    ckpt_meta_path = Path(config.checkpoint) / "metadata.json"
+    with open(ckpt_meta_path) as f:
+        ckpt_metadata = json.load(f)
+
     print(
         json.dumps(
             {"event": "eval_store_init", "model_name": config.model_name},
@@ -58,7 +62,18 @@ def run_eval(config: SPALFConfig) -> dict:
         seed=config.seed,
     )
 
-    results = {}
+    cal = ckpt_metadata["calibration"]
+    results = {
+        "_metadata": {
+            "model_name": config.model_name,
+            "hook_point": config.hook_point,
+            "d": cal["d"],
+            "F": cal["F"],
+            "V": cal["V"],
+            "checkpoint": config.checkpoint,
+            "seed": config.seed,
+        },
+    }
 
     print(json.dumps({"event": "eval_suite_start", "suite": "downstream_loss"}, sort_keys=True), flush=True)
     results["downstream_loss"] = evaluate_downstream_loss(sae, whitener, store)
@@ -97,7 +112,8 @@ def write_results(config: SPALFConfig, results: dict) -> None:
         flush=True,
     )
     for suite_name in results:
-        print(json.dumps({"event": "eval_suite_complete", "suite": suite_name}, sort_keys=True), flush=True)
+        if not suite_name.startswith("_"):
+            print(json.dumps({"event": "eval_suite_complete", "suite": suite_name}, sort_keys=True), flush=True)
 
 
 def main() -> None:
@@ -108,10 +124,6 @@ def main() -> None:
     args = parser.parse_args()
 
     config = SPALFConfig.load(args.config)
-
-    if not config.checkpoint:
-        parser.error("Config must specify 'checkpoint' path for evaluation")
-
     results = run_eval(config)
     write_results(config, results)
 

@@ -17,17 +17,11 @@ def feature_absorption_rate(
     cos_matrix = B_norm.T @ V_norm
     max_cos_per_free = cos_matrix.abs().max(dim=1).values
 
-    n_absorbed_099 = (max_cos_per_free > 0.99).sum().item()
-    n_absorbed_095 = (max_cos_per_free > 0.95).sum().item()
-    n_absorbed_090 = (max_cos_per_free > 0.90).sum().item()
     n_free = W_dec_B.shape[1]
 
     return {
         "n_free": n_free,
-        "n_absorbed_099": n_absorbed_099,
-        "n_absorbed_095": n_absorbed_095,
-        "n_absorbed_090": n_absorbed_090,
-        "absorption_rate_095": n_absorbed_095 / n_free,
         "max_alignment": max_cos_per_free.max().item(),
         "mean_alignment": max_cos_per_free.mean().item(),
+        "std_alignment": max_cos_per_free.std().item(),
     }

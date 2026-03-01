@@ -31,7 +31,7 @@ class NuPIDualUpdater:
         i_term = rhos * e
         p_term = _KAPPA_P * rhos * (e - self._e_prev)
         self._lambdas = torch.clamp(self._lambdas + i_term + p_term, min=0.0)
-        self._e_prev = e.clone()
+        self._e_prev = e
 
     @property
     def lambdas(self) -> Tensor:

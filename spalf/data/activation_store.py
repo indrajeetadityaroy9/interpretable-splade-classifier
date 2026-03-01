@@ -40,14 +40,6 @@ class ActivationStore:
         self._captured_activations: torch.Tensor | None = None
         self._token_iter: Iterator[torch.Tensor] | None = None
 
-        self.model = self._load_model()
-        self.model.eval()
-
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.tokenizer.pad_token = self.tokenizer.eos_token
-
-    def _load_model(self) -> AutoModelForCausalLM:
-        """Load HuggingFace causal language model."""
         print(
             json.dumps(
                 {
@@ -59,15 +51,18 @@ class ActivationStore:
             ),
             flush=True,
         )
-        model = AutoModelForCausalLM.from_pretrained(
-            self.model_name,
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name,
             torch_dtype=torch.bfloat16,
             device_map=self.device,
             attn_implementation="sdpa",
         )
-        self._hf_target_module = self._resolve_hf_module(model)
-        self._register_hf_hook(model)
-        return model
+        self.model.eval()
+        self._hf_target_module = dict(self.model.named_modules())[self.hook_point]
+        self._register_hf_hook(self.model)
+
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.tokenizer.pad_token = self.tokenizer.eos_token
 
     def _register_hf_hook(self, model: AutoModelForCausalLM) -> None:
         """Register a forward hook to capture residual stream activations."""
@@ -76,38 +71,6 @@ class ActivationStore:
             self._captured_activations = output[0].detach()
 
         self._hook_handle = self._hf_target_module.register_forward_hook(hook_fn)
-
-    def _parse_layer_index(self) -> int:
-        """Extract layer index from hook_point string like 'gpt_neox.layers.6'."""
-        for part in self.hook_point.split("."):
-            if part.isdigit():
-                return int(part)
-        raise ValueError(f"Unable to parse layer index from hook point: {self.hook_point}")
-
-    def _resolve_hf_module(self, model: AutoModelForCausalLM):
-        """Resolve the HuggingFace module to hook via named_modules() lookup."""
-        modules = dict(model.named_modules())
-
-        if self.hook_point in modules:
-            return modules[self.hook_point]
-
-        layer_idx = self._parse_layer_index()
-        for pattern in [
-            f"model.layers.{layer_idx}",
-            f"gpt_neox.layers.{layer_idx}",
-            f"transformer.h.{layer_idx}",
-            f"model.decoder.layers.{layer_idx}",
-            f"model.model.layers.{layer_idx}",
-        ]:
-            if pattern in modules:
-                return modules[pattern]
-
-        layer_modules = [n for n, _ in model.named_modules() if n and any(c.isdigit() for c in n)]
-        raise ValueError(
-            f"Cannot resolve hook target for '{self.hook_point}'. "
-            f"Set hook_point to a PyTorch module path. "
-            f"Layer modules: {layer_modules}"
-        )
 
     def _token_generator(self) -> Iterator[torch.Tensor]:
         """Yield batches of token IDs. Shuffled streaming with batched tokenization."""
@@ -177,10 +140,6 @@ class ActivationStore:
         """Get W_vocab: the unembedding matrix [d_model, V]."""
         lm_head = self.model.get_output_embeddings()
         return lm_head.weight.T.float()
-
-    def get_model(self) -> AutoModelForCausalLM:
-        """Return the underlying model (for KL computation via patched forward)."""
-        return self.model
 
     @property
     def d_model(self) -> int:

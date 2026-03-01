@@ -68,7 +68,8 @@ class OnlineCovariance:
         self._snapshot_cov = current_cov.clone()
         self._n_at_snapshot = self._n
 
-    def has_converged(self) -> bool:
+    @property
+    def converged(self) -> bool:
         return self._converged
 
     def get_mean(self) -> torch.Tensor:

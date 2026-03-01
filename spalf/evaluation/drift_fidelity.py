@@ -15,8 +15,6 @@ def drift_fidelity(
 
     return {
         "mean": cos_sim.mean().item(),
+        "std": cos_sim.std().item(),
         "min": cos_sim.min().item(),
-        "max": cos_sim.max().item(),
-        "frac_above_099": (cos_sim > 0.99).float().mean().item(),
-        "frac_above_095": (cos_sim > 0.95).float().mean().item(),
     }

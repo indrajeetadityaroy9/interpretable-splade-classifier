@@ -6,7 +6,7 @@ import os
 import torch
 
 from spalf.config import SPALFConfig
-from spalf.training.trainer import SPALFTrainer
+from spalf.training.trainer import train
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -26,8 +26,7 @@ def main() -> None:
     args = parser.parse_args()
 
     config = SPALFConfig.load(args.config)
-    trainer = SPALFTrainer(config)
-    trainer.train()
+    train(config)
 
 
 if __name__ == "__main__":

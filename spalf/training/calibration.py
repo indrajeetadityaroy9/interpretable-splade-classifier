@@ -23,31 +23,15 @@ def run_calibration(
     L0_target = config.L0_target if config.L0_target is not None else math.ceil(F / 400)
 
     cov = OnlineCovariance(d)
-    cov_max_samples = 20 * cov.check_interval
 
-    while not cov.has_converged():
+    while not cov.converged:
         batch = store.next_batch()
         cov.update(batch)
-
-        if cov.n_samples > cov_max_samples:
-            print(
-                json.dumps(
-                    {
-                        "event": "covariance_limit_reached",
-                        "max_samples": cov_max_samples,
-                        "n_samples": cov.n_samples,
-                    },
-                    sort_keys=True,
-                ),
-                flush=True,
-            )
-            break
 
     print(
         json.dumps(
             {
                 "event": "covariance_ready",
-                "converged": cov.has_converged(),
                 "n_samples": cov.n_samples,
             },
             sort_keys=True,

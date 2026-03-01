@@ -26,7 +26,7 @@ class SoftZCAWhitener:
         self.d = mean.shape[0]
         self.rho_oas = rho_oas
 
-        self._mean = mean.float()
+        self.mean = mean.float()
         self._eigenvalues = eigenvalues.float()
         self._eigenvectors = eigenvectors.float()
 
@@ -35,16 +35,15 @@ class SoftZCAWhitener:
 
         if rho_oas < 1.0:
             cutoff = rho_oas * mu / (1 - rho_oas)
-            self._k = int((self._eigenvalues > cutoff).sum().item())
-            self._k = max(self._k, 1)
+            self._k = (self._eigenvalues > cutoff).sum().item()
         else:
             self._k = self.d
 
-        self._effective_rank = self._k
-        self._low_rank = self._k < self.d // 4
+        self.effective_rank = self._k
+        self.is_low_rank = self._k < self.d // 4
 
-        if self._low_rank:
-            self._U_k = self._eigenvectors[:, : self._k].contiguous()
+        if self.is_low_rank:
+            self._U_k = self._eigenvectors[:, : self._k]
             self._Lambda_k = reg_eigenvalues[: self._k]
 
             self._lambda_bar = float(reg_eigenvalues[self._k :].mean())
@@ -111,7 +110,7 @@ class SoftZCAWhitener:
         trace_s2 = eigenvalues.pow(2).sum().item()
         num = (1 - 2.0 / d) * trace_s2 + trace_s ** 2
         denom = (n_samples + 1 - 2.0 / d) * (trace_s2 - trace_s ** 2 / d)
-        rho_oas = max(0.0, min(num / denom, 1.0)) if abs(denom) > 1e-12 else 0.0
+        rho_oas = max(0.0, min(num / denom, 1.0))
 
         print(
             json.dumps(
@@ -137,11 +136,11 @@ class SoftZCAWhitener:
 
     def to(self, device: torch.device) -> "SoftZCAWhitener":
         """Move all tensors to a device."""
-        self._mean = self._mean.to(device)
+        self.mean = self.mean.to(device)
         self._eigenvalues = self._eigenvalues.to(device)
         self._eigenvectors = self._eigenvectors.to(device)
 
-        if self._low_rank:
+        if self.is_low_rank:
             self._U_k = self._U_k.to(device)
             self._Lambda_k = self._Lambda_k.to(device)
             self._scale_k = self._scale_k.to(device)
@@ -155,9 +154,9 @@ class SoftZCAWhitener:
 
     def forward(self, x: Tensor) -> Tensor:
         """Whiten activations."""
-        centered = x - self._mean
+        centered = x - self.mean
 
-        if self._low_rank:
+        if self.is_low_rank:
             proj = centered @ self._U_k
             whitened_proj = proj * self._scale_k
             result_top = whitened_proj @ self._U_k.T
@@ -171,7 +170,7 @@ class SoftZCAWhitener:
 
     def inverse(self, x_tilde: Tensor) -> Tensor:
         """Map whitened activations back to original space."""
-        if self._low_rank:
+        if self.is_low_rank:
             proj = x_tilde @ self._U_k
             unwhitened_proj = proj * self._inv_scale_k
             result_top = unwhitened_proj @ self._U_k.T
@@ -179,13 +178,13 @@ class SoftZCAWhitener:
             complement = x_tilde - (proj @ self._U_k.T)
             result_tail = complement * self._inv_scale_tail
 
-            return result_top + result_tail + self._mean
+            return result_top + result_tail + self.mean
         else:
-            return x_tilde @ self._W_white_inv.T + self._mean
+            return x_tilde @ self._W_white_inv.T + self.mean
 
     def compute_mahalanobis_sq(self, diff: Tensor) -> Tensor:
         """Compute ||diff||^2 in the regularized precision metric."""
-        if self._low_rank:
+        if self.is_low_rank:
             proj = diff @ self._U_k
             scaled_proj = proj * self._scale_k
             top_term = (scaled_proj**2).sum(dim=1)
@@ -197,32 +196,10 @@ class SoftZCAWhitener:
         else:
             return (diff @ self._precision * diff).sum(dim=1)
 
-    @property
-    def W_white(self) -> Tensor:
-        """Full whitening matrix [d, d]. Only available for non-low-rank."""
-        return self._W_white
-
-    @property
-    def W_white_inv(self) -> Tensor:
-        """Full inverse whitening matrix [d, d]. Only available for non-low-rank."""
-        return self._W_white_inv
-
-    @property
-    def effective_rank(self) -> int:
-        return self._effective_rank
-
-    @property
-    def is_low_rank(self) -> bool:
-        return self._low_rank
-
-    @property
-    def mean(self) -> Tensor:
-        return self._mean
-
     def state_dict(self) -> dict:
         """Serialize whitener state for checkpointing."""
         return {
-            "mean": self._mean,
+            "mean": self.mean,
             "eigenvalues": self._eigenvalues,
             "eigenvectors": self._eigenvectors,
             "rho_oas": torch.tensor(self.rho_oas),
@@ -234,5 +211,5 @@ class SoftZCAWhitener:
             mean=sd["mean"],
             eigenvalues=sd["eigenvalues"],
             eigenvectors=sd["eigenvectors"],
-            rho_oas=float(sd["rho_oas"].item()),
+            rho_oas=sd["rho_oas"].item(),
         )

@@ -55,11 +55,7 @@ def run_training_loop(
     total_steps = config.total_tokens // config.batch_size
     token_iter = None
     kl_div_value = 0.0
-
-    if disc_schedule.onset_step < total_steps:
-        kl_onset_step: int | None = disc_schedule.onset_step
-    else:
-        kl_onset_step = None
+    kl_onset_step = disc_schedule.onset_step if disc_schedule.onset_step < total_steps else None
 
     print(
         json.dumps(
@@ -79,7 +75,7 @@ def run_training_loop(
     for step in range(start_step, total_steps):
         kl_div = None
         w_kl = 0.0
-        if kl_onset_step is not None and store is not None:
+        if kl_onset_step is not None:
             w_kl = (step - kl_onset_step) / (total_steps - kl_onset_step)
             if token_iter is None:
                 token_iter = store._token_generator()
@@ -99,39 +95,40 @@ def run_training_loop(
             lambda_disc = disc_schedule.get_lambda(step)
             x_hat, z, gate_mask, l0_probs, disc_raw = sae(x_tilde, lambda_disc)
 
-            mahal_sq = whitener.compute_mahalanobis_sq(x - x_hat)
+        # Constraints, violations, and AL penalty computed in float32 for precision.
+        mahal_sq = whitener.compute_mahalanobis_sq(x - x_hat)
 
-            if kl_div is not None and w_kl > 0:
-                kl_self_norm = kl_div / (kl_div.detach() + EPS_NUM)
-                v_faith_mse = compute_faithfulness_violation(mahal_sq, tau_faith)
-                v_faith = (1.0 - w_kl) * v_faith_mse + w_kl * kl_self_norm
-            else:
-                v_faith = compute_faithfulness_violation(mahal_sq, tau_faith)
+        if kl_div is not None and w_kl > 0:
+            kl_self_norm = kl_div / (kl_div.detach() + EPS_NUM)
+            v_faith_mse = compute_faithfulness_violation(mahal_sq, tau_faith)
+            v_faith = (1.0 - w_kl) * v_faith_mse + w_kl * kl_self_norm
+        else:
+            v_faith = compute_faithfulness_violation(mahal_sq, tau_faith)
 
-            v_drift = compute_drift_violation(sae.W_dec_A, W_vocab, tau_drift)
-            v_ortho = compute_orthogonality_violation(
-                z, sae.W_dec_A, sae.W_dec_B, tau_ortho, sae.gamma
-            )
-            violations = torch.stack([v_faith, v_drift, v_ortho])
+        v_drift = compute_drift_violation(sae.W_dec_A, W_vocab, tau_drift)
+        v_ortho = compute_orthogonality_violation(
+            z.detach(), sae.W_dec_A, sae.W_dec_B, tau_ortho, sae.gamma
+        )
+        violations = torch.stack([v_faith, v_drift, v_ortho])
 
-            ema.update(violations)
+        ema.update(violations)
 
-            disc_correction = disc_raw.mean()
-            l0_loss = l0_probs.mean()
-            l0_corr = l0_loss + disc_correction
+        disc_correction = disc_raw.mean()
+        l0_loss = l0_probs.mean()
+        l0_corr = l0_loss + disc_correction
 
-            lagrangian = compute_augmented_lagrangian(
-                l0_corr=l0_corr,
-                violations=violations,
-                lambdas=dual_updater.lambdas,
-                rhos=capu.rhos,
-            )
+        lagrangian = compute_augmented_lagrangian(
+            l0_corr=l0_corr,
+            violations=violations,
+            lambdas=dual_updater.lambdas,
+            rhos=capu.rhos,
+        )
 
         optimizer.zero_grad()
         lagrangian.backward()
         optimizer.step()
 
-        if step % slow_update_interval == 0 and step > 0:
+        if step % slow_update_interval == 0:
             dual_updater.step(ema.v_slow, capu.rhos)
             capu.step(ema.v_fast)
             with torch.no_grad():
@@ -140,7 +137,7 @@ def run_training_loop(
 
         sae.normalize_free_decoder()
 
-        if kl_onset_step is None and store is not None:
+        if kl_onset_step is None:
             if (ema.v_slow < 0).all().item():
                 kl_onset_step = step
                 disc_schedule.set_onset(step)
@@ -160,7 +157,6 @@ def run_training_loop(
 
         if (
             config.checkpoint_interval > 0
-            and step > 0
             and step % config.checkpoint_interval == 0
         ):
             ckpt_dir = Path(config.output_dir) / f"checkpoint_step{step}"
@@ -175,13 +171,13 @@ def run_training_loop(
             )
 
         if step % 100 == 0:
-            with torch.no_grad():
-                l0_mean = gate_mask.sum(dim=1).mean().item()
-                mse = (x - x_hat).pow(2).sum(dim=1).mean().item()
-                x_var = x.pow(2).sum(dim=1).mean().item()
-                r_squared = 1.0 - mse / x_var
-                kl_div_value = kl_div.item() if kl_div is not None else 0.0
-                lam = dual_updater.lambdas
+            l0_mean = gate_mask.sum(dim=1).mean().item()
+            mse = (x - x_hat).pow(2).sum(dim=1).mean().item()
+            x_centered = x - x.mean(dim=0)
+            x_var = x_centered.pow(2).sum(dim=1).mean().item()
+            r_squared = 1.0 - mse / (x_var + EPS_NUM)
+            kl_div_value = kl_div.item() if kl_div is not None else 0.0
+            lam = dual_updater.lambdas
 
             print(
                 json.dumps(

@@ -23,12 +23,10 @@ class DiscretizationSchedule:
         if step <= self.onset_step:
             return 0.0
         remaining = self.T_total - self.onset_step
-        if remaining <= 0:
-            return self.lambda_max
         return self.lambda_max * (step - self.onset_step) / remaining
 
     def state_dict(self) -> dict:
         return {"onset_step": torch.tensor(self.onset_step)}
 
     def load_state_dict(self, sd: dict) -> None:
-        self.onset_step = int(sd["onset_step"].item())
+        self.onset_step = sd["onset_step"].item()

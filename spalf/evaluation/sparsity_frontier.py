@@ -1,18 +1,23 @@
-"""Sparsity frontier: L0 vs Loss Recovered Pareto curve via threshold sweeping."""
+"""Sparsity frontier: L0 vs Loss Recovered Pareto curve via threshold sweeping.
 
+Evaluation budget: ~2M tokens (2^21) per phase, matching Rajamanoharan et al.
+(2024) and Lieberum et al. (2024). Multipliers are log-uniform in the native
+parameter space of log_threshold.
+"""
 
 import json
+import math
 
 import torch
 import torch.nn.functional as F
 
 from spalf.data.activation_store import ActivationStore
 from spalf.data.patching import run_patched_forward, run_zero_ablation_forward
-from spalf.evaluation.convergence import WelfordMean
 from spalf.model import StratifiedSAE
 from spalf.whitening.whitener import SoftZCAWhitener
 
-_DEFAULT_MULTIPLIERS: list[float] = [0.5, 0.7, 0.85, 1.0, 1.15, 1.3, 1.5, 2.0, 3.0]
+# 2^21 tokens ≈ 2M, matching JumpReLU / Gemma Scope evaluation standard.
+_EVAL_TOKENS: int = 2_097_152
 
 
 @torch.no_grad()
@@ -21,29 +26,27 @@ def compute_sparsity_frontier(
     whitener: SoftZCAWhitener,
     store: ActivationStore,
 ) -> list[dict[str, float]]:
-    """Sweep threshold multipliers to trace the L0-vs-Loss-Recovered frontier.
-
-    Self-terminating: each phase (baseline + per-multiplier) runs until the CE estimate
-    reaches 2% relative standard error (minimum 500K tokens, hard cap 10M per phase).
-    """
+    """Sweep threshold multipliers to trace the L0-vs-Loss-Recovered frontier."""
     device = next(sae.parameters()).device
-    multipliers = _DEFAULT_MULTIPLIERS
+    tokens_per_batch = store.batch_size * store.seq_len
+    n_eval_batches = _EVAL_TOKENS // tokens_per_batch
+
+    # Log-uniform spacing: uniform in log_threshold's native space.
+    multipliers = torch.logspace(math.log10(0.5), math.log10(3.0), 9).tolist()
 
     # --- Baseline: zero-ablation and original CE ---
     total_ce_zero = 0.0
     total_ce_orig = 0.0
     total_tokens_baseline = 0
-    tracker_baseline = WelfordMean()
 
     baseline_iter = store._token_generator()
-    while True:
+    for _ in range(n_eval_batches):
         tokens = next(baseline_iter).to(device)
         B, S = tokens.shape
         labels = tokens[:, 1:]
         n_tok = B * (S - 1)
 
-        model = store.get_model()
-        orig_logits = model(tokens).logits
+        orig_logits = store.model(tokens).logits
         zero_logits = run_zero_ablation_forward(store, tokens)
 
         orig_flat = orig_logits[:, :-1].reshape(-1, orig_logits.shape[-1]).float()
@@ -56,13 +59,6 @@ def compute_sparsity_frontier(
         total_ce_orig += ce_orig * n_tok
         total_ce_zero += ce_zero * n_tok
         total_tokens_baseline += n_tok
-
-        tracker_baseline.update(ce_zero - ce_orig)
-
-        if total_tokens_baseline >= 500_000 and tracker_baseline.relative_se < 0.02:
-            break
-        if total_tokens_baseline >= 10_000_000:
-            break
 
     avg_ce_orig = total_ce_orig / total_tokens_baseline
     avg_ce_zero = total_ce_zero / total_tokens_baseline
@@ -90,14 +86,14 @@ def compute_sparsity_frontier(
 
         total_l0 = 0.0
         total_mse = 0.0
+        total_var = 0.0
         total_ce_patched = 0.0
         total_tokens = 0
         total_activations = 0
-        tracker_point = WelfordMean()
 
         token_iter = store._token_generator()
 
-        while True:
+        for _ in range(n_eval_batches):
             tokens = next(token_iter).to(device)
             B, S = tokens.shape
 
@@ -116,27 +112,24 @@ def compute_sparsity_frontier(
 
             total_l0 += gate_mask.sum(dim=1).mean().item() * n_act
             total_mse += (x_flat - x_hat_flat).pow(2).sum(dim=1).mean().item() * n_act
+            x_centered = x_flat - x_flat.mean(dim=0)
+            total_var += x_centered.pow(2).sum(dim=1).mean().item() * n_act
             total_ce_patched += ce_patched.item() * n_tok
             total_tokens += n_tok
             total_activations += n_act
 
-            tracker_point.update(ce_patched.item())
-
-            if total_tokens >= 500_000 and tracker_point.relative_se < 0.02:
-                break
-            if total_tokens >= 10_000_000:
-                break
-
         avg_ce_patched = total_ce_patched / total_tokens
         loss_recovered = (avg_ce_zero - avg_ce_patched) / denominator
 
+        avg_mse = total_mse / total_activations
         point = {
             "multiplier": mult,
             "l0": total_l0 / total_activations,
             "ce_loss_increase": avg_ce_patched - avg_ce_orig,
             "loss_recovered": loss_recovered,
-            "mse": total_mse / total_activations,
-            "tokens_per_point": total_tokens,
+            "mse": avg_mse,
+            "fvu": avg_mse / (total_var / total_activations),
+            "eval_tokens": total_tokens,
         }
         results.append(point)
 

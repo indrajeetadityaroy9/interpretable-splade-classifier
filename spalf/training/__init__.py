@@ -1,5 +1,5 @@
 """SPALF training: calibration, optimization loop, orchestration."""
 
-from spalf.training.trainer import SPALFTrainer
+from spalf.training.trainer import train
 
-__all__ = ["SPALFTrainer"]
+__all__ = ["train"]

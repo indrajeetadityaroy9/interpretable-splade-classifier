@@ -55,10 +55,25 @@ class StratifiedSAE(nn.Module):
 
     @torch.no_grad()
     def recalibrate_gamma(self, pre_act: Tensor, c_epsilon: float) -> None:
-        """Recalibrate Moreau bandwidth from current pre-activation statistics."""
-        q75 = torch.quantile(pre_act, 0.75, dim=0)
-        q25 = torch.quantile(pre_act, 0.25, dim=0)
+        """Recalibrate Moreau bandwidth from threshold-local IQR.
+
+        Restricts IQR to a ±2σ window around each feature's threshold so gamma
+        tracks jump-region curvature rather than the full pre-activation spread.
+        """
+        thresholds = self.log_threshold.exp()
+        std_all = pre_act.std(dim=0)
+
+        lower = thresholds - 2.0 * std_all
+        upper = thresholds + 2.0 * std_all
+        mask = (pre_act > lower.unsqueeze(0)) & (pre_act < upper.unsqueeze(0))
+
+        masked = pre_act.clone()
+        masked[~mask] = float("nan")
+        q75 = torch.nanquantile(masked, 0.75, dim=0)
+        q25 = torch.nanquantile(masked, 0.25, dim=0)
         iqr = q75 - q25
+        iqr = torch.where(iqr.isnan(), std_all, iqr)
+
         self.gamma.copy_((c_epsilon * iqr).pow(2) / 2.0)
 
     @torch.no_grad()

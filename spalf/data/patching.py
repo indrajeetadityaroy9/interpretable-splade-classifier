@@ -17,7 +17,7 @@ def run_patched_forward(
     tokens: Tensor,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Run original and SAE-patched forwards and return logits plus SAE intermediates."""
-    model = store.get_model()
+    model = store.model
 
     orig_logits = model(tokens).logits
     x_raw = store._captured_activations
@@ -50,7 +50,7 @@ def run_zero_ablation_forward(
     tokens: Tensor,
 ) -> Tensor:
     """Zero-ablation forward: replace hook point activations with zeros. Returns logits."""
-    model = store.get_model()
+    model = store.model
 
     original_hook = store._hook_handle
     original_hook.remove()

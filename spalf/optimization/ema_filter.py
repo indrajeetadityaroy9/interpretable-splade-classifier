@@ -37,15 +37,11 @@ class DualRateEMA:
     @property
     def v_fast(self) -> Tensor:
         """Bias-corrected fast EMA of violations [n_constraints]."""
-        if self._n_updates == 0:
-            return self._v_fast_raw
         return self._v_fast_raw / (1 - self.beta_fast ** self._n_updates)
 
     @property
     def v_slow(self) -> Tensor:
         """Bias-corrected slow EMA of violations [n_constraints]."""
-        if self._n_updates == 0:
-            return self._v_slow_raw
         return self._v_slow_raw / (1 - self.beta_slow ** self._n_updates)
 
     def state_dict(self) -> dict:
@@ -58,4 +54,4 @@ class DualRateEMA:
     def load_state_dict(self, sd: dict) -> None:
         self._v_fast_raw = sd["v_fast_raw"].to(device)
         self._v_slow_raw = sd["v_slow_raw"].to(device)
-        self._n_updates = int(sd["n_updates"].item())
+        self._n_updates = sd["n_updates"].item()

@@ -42,25 +42,19 @@ class SPALFConfig:
 
     checkpoint: str = ""
 
-    def to_dict(self) -> dict:
-        """Serialize to dictionary."""
-        return dataclasses.asdict(self)
-
     def save(self, path: str | Path) -> None:
         """Save config to YAML."""
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w") as f:
-            yaml.dump(self.to_dict(), f, default_flow_style=False, sort_keys=False)
+            yaml.dump(dataclasses.asdict(self), f, default_flow_style=False, sort_keys=False)
 
     @classmethod
     def load(cls, path: str | Path) -> SPALFConfig:
-        """Load config from YAML. Unknown keys are ignored."""
+        """Load config from YAML."""
         with open(path) as f:
             data = yaml.safe_load(f)
-        valid_fields = {f.name for f in cls.__dataclass_fields__.values()}
-        filtered = {k: v for k, v in data.items() if k in valid_fields}
-        return cls(**filtered)
+        return cls(**data)
 
 
 @dataclass

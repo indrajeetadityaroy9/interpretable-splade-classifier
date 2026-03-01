@@ -1,5 +1,6 @@
 """Checkpoint utilities for Accelerate-managed training state + frozen calibration artifacts."""
 
+import dataclasses
 import json
 from pathlib import Path
 
@@ -33,7 +34,7 @@ def save_calibration_state(
 
     metadata = {
         "step": step,
-        "config": config.to_dict(),
+        "config": dataclasses.asdict(config),
         "calibration": {
             "d": cal.d,
             "V": cal.V,
@@ -66,9 +67,8 @@ def load_checkpoint(
     )
     whitener = SoftZCAWhitener.__new__(SoftZCAWhitener)
     whitener.load_state_dict(cal_state)
-    whitener.to(device)
 
-    W_vocab = cal_state["W_vocab"].to(device)
+    W_vocab = cal_state["W_vocab"]
 
     print(
         json.dumps(
