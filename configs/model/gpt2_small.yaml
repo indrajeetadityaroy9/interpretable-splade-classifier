@@ -1,5 +1,4 @@
 model_name: "openai-community/gpt2"
-hook_point: "transformer.h.8"
 dataset: "Skylion007/openwebtext"
 text_column: "text"
 dataset_split: "train"

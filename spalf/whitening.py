@@ -1,10 +1,3 @@
-"""Soft-ZCA whitening: Frequent Directions sketch + LW2020 nonlinear shrinkage.
-
-Covariance estimation via Frequent Directions (Liberty, KDD 2013; Ghashami et al.,
-SIAM J. Computing 2016). Regularization via Ledoit-Wolf analytical nonlinear shrinkage
-(Annals of Statistics, Vol 48 No 5, 2020).
-"""
-
 import torch
 from torch import Tensor
 

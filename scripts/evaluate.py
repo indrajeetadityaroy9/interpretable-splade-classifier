@@ -1,17 +1,19 @@
-"""SPALF evaluation entrypoint."""
-
 import json
-
+import os
 import hydra
+import torch
 from omegaconf import DictConfig
 
-from spalf import configure_cuda
 from spalf.evaluation import evaluate_checkpoint
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="default")
 def main(cfg: DictConfig) -> None:
-    configure_cuda()
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cudnn.benchmark = True
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     results = evaluate_checkpoint(cfg)
     print(json.dumps(results, indent=2))
 

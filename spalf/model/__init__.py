@@ -1,1 +1,0 @@
-"""Stratified SAE model components."""

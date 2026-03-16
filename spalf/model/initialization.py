@@ -1,8 +1,5 @@
-"""SAE initialization: matched-filter encoder, decoder init, threshold calibration."""
-
 import torch
 from torch import Tensor
-
 from spalf.data.store import ActivationStore
 from spalf.model.constraints import compute_orthogonality_violation
 from spalf.model.sae import StratifiedSAE

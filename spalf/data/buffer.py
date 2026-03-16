@@ -1,24 +1,13 @@
-"""In-memory activation buffer with background prefetch for decorrelation.
-
-Uses a dedicated CUDA stream + background thread so buffer refills overlap
-with training compute on the default stream.
-"""
-
 import threading
-
 import torch
-
 from spalf.data.store import ActivationStore
 
 
 class ActivationBuffer:
-    """Activation buffer that serves shuffled batches with async prefetch."""
-
     def __init__(
         self,
         store: ActivationStore,
-        # Default 2^20 (~1M tokens); overridden by config.buffer_size in training.
-        buffer_size: int = 2**20,
+        buffer_size: int,
     ) -> None:
         self.store = store
         self.buffer_size = buffer_size
@@ -42,7 +31,6 @@ class ActivationBuffer:
         return torch.cat(chunks, dim=0)[: self.buffer_size]
 
     def _refill_half_impl(self) -> None:
-        """Replace half the buffer with fresh activations on a dedicated CUDA stream."""
         half = self.buffer_size // 2
         chunks: list[torch.Tensor] = []
         total = 0
@@ -63,19 +51,14 @@ class ActivationBuffer:
         self._ptr = end % self.buffer_size
         self._refill_event = self._refill_stream.record_event()
 
-    def _wait_for_refill(self) -> None:
-        """Block until any in-flight background refill completes."""
+    def next_batch(self, batch_size: int) -> torch.Tensor:
+        """Return a shuffled batch of activations [batch_size, d_model]."""
         if self._refill_thread is not None:
             self._refill_thread.join()
             self._refill_thread = None
         if self._refill_event is not None:
             self._refill_event.synchronize()
             self._refill_event = None
-
-    def next_batch(self, batch_size: int) -> torch.Tensor:
-        """Return a shuffled batch of activations [batch_size, d_model]."""
-        # Ensure any prior refill is complete before reading.
-        self._wait_for_refill()
 
         indices = torch.randint(0, self.buffer_size, (batch_size,), device="cuda")
         batch = self._buffer[indices]

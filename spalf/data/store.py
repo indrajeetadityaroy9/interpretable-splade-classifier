@@ -1,7 +1,4 @@
-"""Activation streaming via HuggingFace model hooks."""
-
 from collections.abc import Callable, Iterator
-
 import numpy as np
 import torch
 from datasets import load_dataset
@@ -9,12 +6,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 class ActivationStore:
-    """Streams residual activations from HuggingFace causal language models."""
-
     def __init__(
         self,
         model_name: str,
-        hook_point: str,
         dataset_name: str,
         batch_size: int,
         seq_len: int = 128,
@@ -24,7 +18,6 @@ class ActivationStore:
         seed: int = 42,
     ) -> None:
         self.model_name = model_name
-        self.hook_point = hook_point
         self.dataset_name = dataset_name
         self.batch_size = batch_size
         self.seq_len = seq_len
@@ -33,7 +26,6 @@ class ActivationStore:
         self.dataset_config = dataset_config
         self.seed = seed
 
-        self._hook_handle = None
         self._captured_activations: torch.Tensor | None = None
 
         self.model = AutoModelForCausalLM.from_pretrained(
@@ -43,6 +35,13 @@ class ActivationStore:
             attn_implementation="sdpa",
         )
         self.model.eval()
+
+        # Auto-derive hook point: midpoint transformer layer.
+        n = self.model.config.num_hidden_layers
+        self.hook_point = next(
+            name for name, _ in self.model.named_modules()
+            if name.split(".")[-1] == str(n // 2)
+        )
         self._hf_target_module = dict(self.model.named_modules())[self.hook_point]
         self._hook_handle = self._hf_target_module.register_forward_hook(
             lambda _mod, _inp, out: setattr(self, "_captured_activations", out[0].detach())

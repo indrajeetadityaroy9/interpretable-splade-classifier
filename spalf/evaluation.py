@@ -1,8 +1,4 @@
-"""SPALF evaluation: patching utilities, checkpoint loading, self-terminating metrics.
-
-Shared inference utilities (run_patched_forward, compute_kl) are used by both
-the training loop (KL constraint) and post-hoc evaluation.
-"""
+"""SPALF evaluation: patching utilities, checkpoint loading, self-terminating metrics."""
 
 import json
 import math
@@ -13,6 +9,7 @@ import torch.nn.functional as F_fn
 from omegaconf import DictConfig
 from safetensors.torch import load_file
 from torch import Tensor
+from torchmetrics import MeanMetric
 
 from spalf.data.store import ActivationStore
 from spalf.data.buffer import ActivationBuffer
@@ -56,35 +53,6 @@ def compute_kl(orig_logits: Tensor, patched_logits: Tensor) -> Tensor:
     return F_fn.kl_div(log_q, log_p, reduction="batchmean", log_target=True)
 
 
-class WelfordMean:
-    """Online mean + relative standard error via Welford's algorithm."""
-
-    def __init__(self) -> None:
-        self.n = 0
-        self._mean = 0.0
-        self._m2 = 0.0
-
-    def update(self, x: float) -> None:
-        self.n += 1
-        delta = x - self._mean
-        self._mean += delta / self.n
-        delta2 = x - self._mean
-        self._m2 += delta * delta2
-
-    @property
-    def mean(self) -> float:
-        return self._mean
-
-    @property
-    def rse(self) -> float:
-        """Relative standard error: SE / |mean|."""
-        if self.n < 2 or self._mean == 0.0:
-            return float("inf")
-        variance = self._m2 / (self.n - 1)
-        se = math.sqrt(variance / self.n)
-        return se / abs(self._mean)
-
-
 def _load_checkpoint(
     checkpoint_path: str,
 ) -> tuple[StratifiedSAE, SoftZCAWhitener, torch.Tensor, dict]:
@@ -117,6 +85,13 @@ def _load_checkpoint(
     return sae, whitener, W_vocab, metadata
 
 
+def _rse(n: int, mean: float, m2: float) -> float:
+    """Relative standard error from Welford running state."""
+    if n < 2 or mean == 0.0:
+        return float("inf")
+    return math.sqrt(m2 / (n * (n - 1))) / abs(mean)
+
+
 @torch.no_grad()
 def evaluate_checkpoint(config: DictConfig) -> dict:
     """Evaluate a trained SAE checkpoint with self-terminating convergence."""
@@ -127,7 +102,6 @@ def evaluate_checkpoint(config: DictConfig) -> dict:
 
     store = ActivationStore(
         model_name=config.model_name,
-        hook_point=config.hook_point,
         dataset_name=config.dataset,
         batch_size=config.batch_size,
         seq_len=config.seq_len,
@@ -139,15 +113,25 @@ def evaluate_checkpoint(config: DictConfig) -> dict:
 
     buffer = ActivationBuffer(store, buffer_size=config.seq_len * config.batch_size)
 
-    r2_tracker = WelfordMean()
-    l0_tracker = WelfordMean()
-    kl_tracker = WelfordMean()
+    # torchmetrics accumulators for reported metrics.
+    mse_metric = MeanMetric().cuda()
+    var_metric = MeanMetric().cuda()
+    l0_metric = MeanMetric().cuda()
+    kl_metric = MeanMetric().cuda()
     feature_counts = torch.zeros(cal["F"], device="cuda")
-    total_samples = 0
+
+    # Welford running state for RSE convergence detection.
+    rse_state = {k: {"n": 0, "mean": 0.0, "m2": 0.0} for k in ("r2", "l0", "kl")}
+
+    def _welford_update(key: str, x: float) -> None:
+        s = rse_state[key]
+        s["n"] += 1
+        delta = x - s["mean"]
+        s["mean"] += delta / s["n"]
+        s["m2"] += delta * (x - s["mean"])
 
     min_batches = math.ceil(cal["F"] / config.batch_size)
     batch_num = 0
-
     token_iter = store._token_generator(config.batch_size)
 
     while True:
@@ -157,36 +141,47 @@ def evaluate_checkpoint(config: DictConfig) -> dict:
         x_tilde = whitener.forward(x)
         x_hat, z, gate_mask, _, _ = sae(x_tilde)
 
-        diff = x - x_hat
-        mse = diff.pow(2).sum(dim=1).mean().item()
-        x_centered = x - x.mean(dim=0)
-        x_var = x_centered.pow(2).sum(dim=1).mean().item()
-        r2_tracker.update(1.0 - mse / x_var)
+        batch_mse = (x - x_hat).pow(2).sum(dim=1).mean()
+        batch_var = (x - x.mean(dim=0)).pow(2).sum(dim=1).mean()
+        mse_metric.update(batch_mse)
+        var_metric.update(batch_var)
 
-        l0_tracker.update(gate_mask.sum(dim=1).float().mean().item())
+        batch_l0 = gate_mask.sum(dim=1).float().mean()
+        l0_metric.update(batch_l0)
 
         feature_counts += gate_mask.any(dim=0).long()
-        total_samples += 1
 
         tokens = next(token_iter).cuda()
         orig_logits, patched_logits = run_patched_forward(
             store, sae, whitener, tokens,
         )
-        kl_val = compute_kl(orig_logits, patched_logits).item()
-        kl_tracker.update(kl_val)
+        batch_kl = compute_kl(orig_logits, patched_logits)
+        kl_metric.update(batch_kl)
+
+        # Update RSE convergence state.
+        batch_r2 = 1.0 - batch_mse.item() / batch_var.item()
+        _welford_update("r2", batch_r2)
+        _welford_update("l0", batch_l0.item())
+        _welford_update("kl", batch_kl.item())
 
         if batch_num >= min_batches:
-            if all(t.rse < convergence_threshold for t in (r2_tracker, l0_tracker, kl_tracker)):
+            converged = all(
+                _rse(rse_state[k]["n"], rse_state[k]["mean"], rse_state[k]["m2"])
+                < convergence_threshold
+                for k in ("r2", "l0", "kl")
+            )
+            if converged:
                 break
 
         if batch_num >= d:
             break
 
-    dead_fraction = (feature_counts == 0).float().mean().item()
+    global_mse = mse_metric.compute().item()
+    global_var = var_metric.compute().item()
 
     return {
-        "r2": r2_tracker.mean,
-        "l0": l0_tracker.mean,
-        "kl_divergence": kl_tracker.mean,
-        "dead_fraction": dead_fraction,
+        "r2": 1.0 - global_mse / global_var,
+        "l0": l0_metric.compute().item(),
+        "kl_divergence": kl_metric.compute().item(),
+        "dead_fraction": (feature_counts == 0).float().mean().item(),
     }

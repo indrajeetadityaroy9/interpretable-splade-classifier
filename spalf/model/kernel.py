@@ -1,5 +1,3 @@
-"""Fused JumpReLU Triton kernels with Moreau envelope STE."""
-
 import torch
 import triton
 import triton.language as tl

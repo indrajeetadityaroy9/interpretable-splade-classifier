@@ -15,14 +15,12 @@ seq_len: 128
 # UX preferences.
 log_interval: 100
 checkpoint_interval: 5000
-kl_batch_size: ${batch_size}
 
 seed: 42
 output_dir: "runs/default"
 resume_from_checkpoint: ""
 checkpoint_path: ""
 
-# Optional overrides (0 / null = use derived values).
-F: 0
-L0_target: 0
+# Vocabulary cap (0 = use full vocabulary).
+# Set in model configs for large-vocabulary models to bound memory.
 V_cap: 0

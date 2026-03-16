@@ -1,11 +1,4 @@
-"""Stratified Sparse Autoencoder: V anchored + (F-V) free decoder columns.
-
-JumpReLU gating with learnable log-thresholds and Moreau bandwidth (γ).
-Forward/backward logic lives in the fused Triton kernel (spalf/model/kernel.py).
-"""
-
 import math
-
 import torch
 import torch.nn as nn
 from torch import Tensor

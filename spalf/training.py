@@ -1,14 +1,3 @@
-"""SPALF training pipeline: calibration, initialization, RC²MA constrained AL loop.
-
-Single-file pipeline that reads top-to-bottom:
-  calibration helpers -> checkpoint helper -> train()
-
-RC²MA (Rate-Certified RCMA) augmentations:
-  A1: Rate-clamped gamma schedule (Böhm & Wright, 2003.07612)
-  A2: Non-monotone CAPU (Dolgopolik, 2412.14269) — in spalf/optim/controller.py
-  A3: CUSUM-gated KL onset (Page, 1954)
-"""
-
 import json
 import math
 import random
@@ -114,29 +103,18 @@ def _run_calibration(config: DictConfig, store: ActivationStore) -> dict:
         config.total_tokens, config.batch_size, config.seq_len,
     )
 
-    # User overrides (explicit config values take precedence over derived).
-    F = config.F if config.F > 0 else hp["F"]
-    L0_target = config.L0_target if config.L0_target > 0 else hp["L0_target"]
-
     return {
         **hp,
         "whitener": whitener, "W_vocab": W_vocab,
-        "d": d, "V": V, "F": F, "L0_target": L0_target,
+        "d": d, "V": V,
         "tau_ortho": 0.0, "tau_kl": None,
-        "primal_tau_names": ["faith", "drift", "ortho"],
-        "onset_tau_names": ["kl"],
+        "n_primal": 3,
+        "n_onset": 1,
     }
 
 
 def _make_grad_clipper(sae: StratifiedSAE, optimizer: torch.optim.Optimizer) -> Callable[[], None]:
-    """AdaGC: clips per-tensor grad norm to EMA of historical norms (arXiv:2502.11034).
-
-    Beta matches Adam's second-moment decay (Kingma & Ba 2015): both track
-    second-order gradient statistics, so the same timescale applies.
-
-    GPU-resident: EMA norms bootstrap from parameter norms (first-step clip
-    ceiling), then blend toward gradient norms. No .item() CUDA syncs.
-    """
+    """AdaGC: per-tensor grad norm clipping against EMA of historical norms."""
     beta = optimizer.defaults["betas"][1]
     params = [p for p in sae.parameters() if p.data.ndim > 1]
     # Bootstrap EMA from parameter norms: first-step ceiling = param magnitude.
@@ -173,6 +151,8 @@ def _save_checkpoint(
     step: int,
     onset_step: int,
     lambda_disc: float,
+    D_ema: float,
+    D_0: float,
 ) -> None:
     """Save training state and calibration artifacts to a checkpoint directory."""
     ckpt_dir = Path(output_dir)
@@ -200,6 +180,8 @@ def _save_checkpoint(
             "tau_ortho": cal["tau_ortho"], "tau_kl": cal["tau_kl"],
         },
         "lambda_disc": lambda_disc,
+        "D_ema": D_ema,
+        "D_0": D_0,
     }
     with open(ckpt_dir / "metadata.json", "w") as f:
         json.dump(metadata, f, indent=2)
@@ -213,15 +195,17 @@ def _calibrate_initial_violations(
     W_vocab: Tensor,
     cal: dict,
     batch_size: int,
-) -> Tensor:
-    """Measure initial constraint violations over n_cal_batches forward passes."""
-    n_primal = len(cal["primal_tau_names"])
-    n_onset = len(cal["onset_tau_names"])
+) -> tuple[Tensor, float]:
+    """Measure initial constraint violations and transition-zone mass D_0."""
+    n_primal = cal["n_primal"]
+    n_onset = cal["n_onset"]
     accum = torch.zeros(n_primal, device="cuda")
+    D_accum = 0.0
     for _ in range(cal["n_cal_batches"]):
         x = buffer.next_batch(batch_size)
         x_tilde = whitener.forward(x)
-        x_hat, z, _, _, _ = sae(x_tilde)
+        x_hat, z, _, _, disc_penalty = sae(x_tilde)
+        D_accum += disc_penalty.mean().item()
         mahal_sq = whitener.compute_mahalanobis_sq(x - x_hat)
         v_faith = mahal_sq.mean() - cal["tau_faith"]
         v_drift = (sae.W_dec_A - W_vocab).pow(2).sum() - cal["tau_drift"]
@@ -230,10 +214,12 @@ def _calibrate_initial_violations(
             sae.gamma_init_mean.item(),
         )
         accum += torch.stack([v_faith, v_drift, v_ortho]).abs()
-    return torch.cat([
+    violations = torch.cat([
         accum / cal["n_cal_batches"],
         torch.ones(n_onset, device="cuda"),
     ])
+    D_0 = D_accum / cal["n_cal_batches"]
+    return violations, D_0
 
 
 def _resume_from_checkpoint(
@@ -245,10 +231,10 @@ def _resume_from_checkpoint(
     whitener: SoftZCAWhitener,
     W_vocab: Tensor,
     cal: dict,
-) -> tuple[int, int, SoftZCAWhitener, Tensor]:
+) -> tuple[int, int, float, float, float, SoftZCAWhitener, Tensor]:
     """Restore training state from a checkpoint directory.
 
-    Returns (start_step, onset_step, whitener, W_vocab).
+    Returns (start_step, onset_step, lambda_disc, D_ema, D_0, whitener, W_vocab).
     """
     ckpt_path = Path(config.resume_from_checkpoint)
     training_state = torch.load(
@@ -283,13 +269,16 @@ def _resume_from_checkpoint(
     return (
         ckpt_meta["step"],
         ckpt_meta["onset_step"],
+        ckpt_meta["lambda_disc"],
+        ckpt_meta["D_ema"],
+        ckpt_meta["D_0"],
         whitener,
         W_vocab,
     )
 
 
 def train(config: DictConfig) -> StratifiedSAE:
-    """Full SPALF pipeline: seed -> calibrate -> initialize -> constrained AL loop."""
+    """Full SPALF pipeline: seed -> calibrate -> initialize -> MTZF constrained AL loop."""
 
     random.seed(config.seed)
     np.random.seed(config.seed)
@@ -298,7 +287,6 @@ def train(config: DictConfig) -> StratifiedSAE:
 
     store = ActivationStore(
         model_name=config.model_name,
-        hook_point=config.hook_point,
         dataset_name=config.dataset,
         batch_size=config.batch_size,
         seq_len=config.seq_len,
@@ -317,9 +305,10 @@ def train(config: DictConfig) -> StratifiedSAE:
     sae = initialize_from_calibration(cal, store)
     sae = torch.compile(sae, mode="max-autotune")
 
-    initial_violations = _calibrate_initial_violations(
+    initial_violations, D_0 = _calibrate_initial_violations(
         buffer, whitener, sae, W_vocab, cal, config.batch_size,
     )
+    D_ema = D_0
 
     total_steps = cal["total_steps"]
 
@@ -328,7 +317,7 @@ def train(config: DictConfig) -> StratifiedSAE:
         initial_violations=initial_violations,
         rho_0=rho_0,
         total_steps=total_steps,
-        n_primal=len(cal["primal_tau_names"]),
+        n_primal=cal["n_primal"],
     )
 
     optimizer = torch.optim.Adam(
@@ -338,10 +327,7 @@ def train(config: DictConfig) -> StratifiedSAE:
     grad_clipper = _make_grad_clipper(sae, optimizer)
 
     warmup = cal["warmup_steps"]
-    # WSD (Warmup-Stable-Decay): decay phase = warmup (both are √T).
-    # The stable phase keeps primal LR constant while dual variables evolve,
-    # avoiding the confound of simultaneously decaying LR and adjusting penalties.
-    # arXiv:2602.06797 (Li et al. 2026); ICLR 2025 river valley analysis.
+    # WSD schedule: warmup √T, stable, decay √T.
     decay_steps = warmup
     stable_end = total_steps - decay_steps
 
@@ -356,21 +342,20 @@ def train(config: DictConfig) -> StratifiedSAE:
 
     start_step = 0
     onset_step = total_steps
+    lambda_disc = 0.0
 
     if config.resume_from_checkpoint:
-        start_step, onset_step, whitener, W_vocab = (
+        start_step, onset_step, lambda_disc, D_ema, D_0, whitener, W_vocab = (
             _resume_from_checkpoint(
                 config, sae, optimizer, scheduler, controller,
                 whitener, W_vocab, cal,
             )
         )
-        with open(Path(config.resume_from_checkpoint) / "metadata.json") as f:
-            lambda_disc = json.load(f)["lambda_disc"]
 
     whitener.forward = torch.compile(whitener.forward)
     whitener.compute_mahalanobis_sq = torch.compile(whitener.compute_mahalanobis_sq)
 
-    token_iter = store._token_generator(config.kl_batch_size)
+    token_iter = store._token_generator(config.batch_size)
     tau_kl = cal["tau_kl"]
     kl_active = tau_kl is not None
 
@@ -381,9 +366,6 @@ def train(config: DictConfig) -> StratifiedSAE:
     kl_sentinel = -tau_vec.sum()
     gamma_init_mean_val = sae.gamma_init_mean.item()
     c_rate = gamma_init_mean_val ** (1.0 / 3.0)
-    controller.init_cusum(tau_vec)
-    if not config.resume_from_checkpoint:
-        lambda_disc = 0.0
 
     # Dead threshold: Poisson-derived, floored at n_cal_batches.
     # P(0 firings in N steps) = exp(-N * batch_size * L0 / F) < 1/F
@@ -425,6 +407,11 @@ def train(config: DictConfig) -> StratifiedSAE:
 
         controller.update(violations)
 
+        # MTZF: update transition-zone mass EMA.
+        D_k = disc_penalty.mean().item()
+        beta = controller._adaptive_beta()
+        D_ema = beta * D_ema + (1.0 - beta) * D_k
+
         # ── AL objective + optimization step ──────────────────────
 
         l0_corr = l0_probs.mean() + lambda_disc * disc_penalty.mean()
@@ -442,35 +429,27 @@ def train(config: DictConfig) -> StratifiedSAE:
         scheduler.step()
         sae.update_dead_counts(gate_mask)
 
-        # ── Slow-timescale updates (RCMA + KL onset) ─────────────
+        # ── Slow-timescale updates (MTZF + KL onset) ─────────────
 
         if controller.should_do_slow_update(step):
-            r_ema = controller.compute_residual(tau_vec)
-            r_inst = controller.compute_residual_instantaneous(violations, tau_vec)
-            r_gamma = max(r_ema, r_inst)
-
             controller.step()
 
+            # MTZF: endogenous gamma coupling from transition-zone mass.
+            ratio = min(D_ema / D_0, 1.0)
+
             if kl_active:
-                lambda_disc = max(1.0 - r_ema, lambda_disc)
+                lambda_disc = max(1.0 - ratio, lambda_disc)
 
             with torch.no_grad():
-                gamma_rcma = sae.gamma_init * max(r_gamma, alpha_floor)
+                gamma_mtzf = sae.gamma_init * max(ratio, alpha_floor)
                 gamma_floor_t = gamma_init_mean_val * max(
                     alpha_floor, c_rate * (step + 1) ** (-1.0 / 3.0)
                 )
-                sae.gamma.copy_(torch.clamp(gamma_rcma, min=gamma_floor_t))
+                sae.gamma.copy_(torch.clamp(gamma_mtzf, min=gamma_floor_t))
 
-        sae.normalize_free_decoder()
-
-        if kl_active and step % dead_threshold == 0:
-            n_resampled = sae.resample_dead_features(
-                x_tilde, x_hat, dead_threshold, cal["L0_target"],
-            )
-
-        if not kl_active:
-            controller.update_cusum(violations)
-            if controller.check_onset():
+            # KL onset: activate when all primal constraints are feasible.
+            # v_ema is TEMA-filtered — represents accumulated feasibility evidence.
+            if not kl_active and (controller.v_ema[:controller.n_primal] < 0).all():
                 onset_step = step
                 tokens = next(token_iter).cuda()
                 with torch.no_grad():
@@ -488,6 +467,13 @@ def train(config: DictConfig) -> StratifiedSAE:
                     "event": "kl_onset", "step": step, "tau_kl": tau_kl,
                 }, sort_keys=True), flush=True)
 
+        sae.normalize_free_decoder()
+
+        if kl_active and step % dead_threshold == 0:
+            n_resampled = sae.resample_dead_features(
+                x_tilde, x_hat, dead_threshold, cal["L0_target"],
+            )
+
         # ── Checkpointing + logging ──────────────────────────────
 
         if config.checkpoint_interval > 0 and step % config.checkpoint_interval == 0:
@@ -495,32 +481,25 @@ def train(config: DictConfig) -> StratifiedSAE:
                 Path(config.output_dir) / f"checkpoint_step{step}",
                 sae, optimizer, scheduler, controller,
                 whitener, W_vocab, cal, config, step, onset_step,
-                lambda_disc,
+                lambda_disc, D_ema, D_0,
             )
 
         if step % config.log_interval == 0:
-            # Single CUDA sync: stack all scalars, transfer once.
             diff = x - x_hat
             x_centered = x - x.mean(dim=0)
-            v_ema = controller.v_ema
-            n_primal = controller.n_primal
             log_scalars = torch.stack([
                 gate_mask.sum(dim=1).mean(),
                 diff.pow(2).sum(dim=1).mean(),
                 x_centered.pow(2).sum(dim=1).mean(),
-                *[v_ema[i] for i in range(n_primal)],
             ])
-            vals = log_scalars.tolist()  # single sync
-            l0_mean, mse, x_var = vals[0], vals[1], vals[2]
+            l0_mean, mse, x_var = log_scalars.tolist()
 
             metrics = {
                 "event": "train_step", "step": step,
                 "l0": l0_mean, "r2": 1.0 - mse / x_var,
             }
-            for i, name in enumerate(cal["primal_tau_names"]):
-                metrics[f"v_{name}"] = vals[3 + i]
             if kl_active:
-                metrics["v_kl"] = v_ema[n_primal].item()
+                metrics["v_kl"] = controller.v_ema[controller.n_primal].item()
 
             print(json.dumps(metrics, sort_keys=True), flush=True)
 
@@ -529,7 +508,7 @@ def train(config: DictConfig) -> StratifiedSAE:
         Path(config.output_dir) / f"checkpoint_step{total_steps}",
         sae, optimizer, scheduler, controller,
         whitener, W_vocab, cal, config, total_steps, onset_step,
-        lambda_disc,
+        lambda_disc, D_ema, D_0,
     )
 
     return sae
