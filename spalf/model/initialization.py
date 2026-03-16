@@ -57,7 +57,6 @@ def initialize_sae(
         _calibrate_thresholds(sae, whitener, activation_sample, L0_target)
 
         sae.gamma_init.copy_(sae.gamma)
-        sae.gamma_init_mean.fill_(sae.gamma.mean().item())
 
 
 def _calibrate_thresholds(
@@ -114,7 +113,7 @@ def initialize_from_calibration(
         x_tilde = cal["whitener"].forward(activation_sample)
         _, z_init, _, _, _ = sae(x_tilde)
         raw_ortho = compute_orthogonality_violation(
-            z_init, sae.W_dec_A, sae.W_dec_B, 0.0, sae.gamma_init_mean.item()
+            z_init, sae.W_dec_A, sae.W_dec_B, 0.0,
         ).item()
     cal["tau_ortho"] = max(raw_ortho, 1.0 / cal["d"])
 

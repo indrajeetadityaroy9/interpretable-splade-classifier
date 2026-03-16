@@ -30,7 +30,6 @@ class StratifiedSAE(nn.Module):
         self.log_threshold = nn.Parameter(torch.zeros(F))
         self.register_buffer("gamma", torch.ones(F))
         self.register_buffer("gamma_init", torch.ones(F))
-        self.register_buffer("gamma_init_mean", torch.tensor(1.0))
         self.register_buffer("dead_counter", torch.zeros(F, dtype=torch.long))
 
     def decode(self, z: Tensor) -> Tensor:

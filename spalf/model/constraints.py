@@ -7,7 +7,6 @@ def compute_orthogonality_violation(
     W_dec_A: Tensor,
     W_dec_B: Tensor,
     tau_ortho: float,
-    gamma_init_mean: float,
 ) -> Tensor:
     """Differentiable co-activation orthogonality violation via column sampling.
 
@@ -35,10 +34,7 @@ def compute_orthogonality_violation(
     G = W_hat.T @ W_hat          # [k, k]
     G_sq = G.pow(2)
 
-    # Masking inactive features avoids injecting orthogonality gradients through dead units.
-    temperature = (2.0 * gamma_init_mean) ** 0.5
-    z_sub = z[:, idx]
-    active = torch.sigmoid(z_sub / temperature) * (z_sub > 0).float()
+    active = (z[:, idx] > 0).float()
 
     C = active.T @ active         # [k, k]
 

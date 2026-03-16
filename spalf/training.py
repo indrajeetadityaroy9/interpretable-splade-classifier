@@ -150,7 +150,6 @@ def _save_checkpoint(
     config: DictConfig,
     step: int,
     onset_step: int,
-    lambda_disc: float,
     D_ema: Tensor,
     D_0: Tensor,
 ) -> None:
@@ -179,7 +178,6 @@ def _save_checkpoint(
             "tau_faith": cal["tau_faith"], "tau_drift": cal["tau_drift"],
             "tau_ortho": cal["tau_ortho"], "tau_kl": cal["tau_kl"],
         },
-        "lambda_disc": lambda_disc,
         "D_ema": D_ema.item(),
         "D_0": D_0.item(),
     }
@@ -211,7 +209,6 @@ def _calibrate_initial_violations(
         v_drift = (sae.W_dec_A - W_vocab).pow(2).sum() - cal["tau_drift"]
         v_ortho = compute_orthogonality_violation(
             z, sae.W_dec_A, sae.W_dec_B, cal["tau_ortho"],
-            sae.gamma_init_mean.item(),
         )
         accum += torch.stack([v_faith, v_drift, v_ortho]).abs()
     violations = torch.cat([
@@ -231,10 +228,10 @@ def _resume_from_checkpoint(
     whitener: SoftZCAWhitener,
     W_vocab: Tensor,
     cal: dict,
-) -> tuple[int, int, float, float, float, SoftZCAWhitener, Tensor]:
+) -> tuple[int, int, float, float, SoftZCAWhitener, Tensor]:
     """Restore training state from a checkpoint directory.
 
-    Returns (start_step, onset_step, lambda_disc, D_ema, D_0, whitener, W_vocab).
+    Returns (start_step, onset_step, D_ema, D_0, whitener, W_vocab).
     """
     ckpt_path = Path(config.resume_from_checkpoint)
     training_state = torch.load(
@@ -269,7 +266,6 @@ def _resume_from_checkpoint(
     return (
         ckpt_meta["step"],
         ckpt_meta["onset_step"],
-        ckpt_meta["lambda_disc"],
         ckpt_meta["D_ema"],
         ckpt_meta["D_0"],
         whitener,
@@ -317,7 +313,6 @@ def train(config: DictConfig) -> StratifiedSAE:
     controller = DualController(
         initial_violations=initial_violations,
         rho_0=rho_0,
-        total_steps=total_steps,
         n_primal=cal["n_primal"],
     )
 
@@ -343,10 +338,9 @@ def train(config: DictConfig) -> StratifiedSAE:
 
     start_step = 0
     onset_step = total_steps
-    lambda_disc = 0.0
 
     if config.resume_from_checkpoint:
-        start_step, onset_step, lambda_disc, D_ema_val, D_0_val, whitener, W_vocab = (
+        start_step, onset_step, D_ema_val, D_0_val, whitener, W_vocab = (
             _resume_from_checkpoint(
                 config, sae, optimizer, scheduler, controller,
                 whitener, W_vocab, cal,
@@ -367,8 +361,6 @@ def train(config: DictConfig) -> StratifiedSAE:
     )
     alpha_floor = (cal["d"] / cal["F"]) ** 2
     kl_sentinel = -tau_vec.sum()
-    gamma_init_mean_val = sae.gamma_init_mean.item()
-    c_rate = gamma_init_mean_val ** (1.0 / 3.0)
 
     # Dead threshold: Poisson-derived, floored at n_cal_batches.
     # P(0 firings in N steps) = exp(-N * batch_size * L0 / F) < 1/F
@@ -402,7 +394,6 @@ def train(config: DictConfig) -> StratifiedSAE:
         v_drift = (sae.W_dec_A - W_vocab).pow(2).sum() - cal["tau_drift"]
         v_ortho = compute_orthogonality_violation(
             z, sae.W_dec_A, sae.W_dec_B, cal["tau_ortho"],
-            gamma_init_mean_val,
         )
 
         v_kl = (kl_div - tau_kl) if kl_active else kl_sentinel
@@ -416,7 +407,7 @@ def train(config: DictConfig) -> StratifiedSAE:
 
         # ── AL objective + optimization step ──────────────────────
 
-        l0_corr = l0_probs.mean() + lambda_disc * disc_penalty.mean()
+        l0_corr = l0_probs.mean() + disc_penalty.mean()
         lagrangian = compute_augmented_lagrangian(
             l0_corr=l0_corr,
             violations=violations,
@@ -436,21 +427,12 @@ def train(config: DictConfig) -> StratifiedSAE:
         if controller.should_do_slow_update(step):
             controller.step()
 
-            # MTZF: endogenous gamma coupling (single GPU→CPU sync per slow update).
+            # MTZF: γ = γ_init · max(D_ema/D_0, α_floor).
             ratio = min((D_ema / D_0).item(), 1.0)
-
-            if kl_active:
-                lambda_disc = max(1.0 - ratio, lambda_disc)
-
             with torch.no_grad():
-                gamma_mtzf = sae.gamma_init * max(ratio, alpha_floor)
-                gamma_floor_t = gamma_init_mean_val * max(
-                    alpha_floor, c_rate * (step + 1) ** (-1.0 / 3.0)
-                )
-                sae.gamma.copy_(torch.clamp(gamma_mtzf, min=gamma_floor_t))
+                sae.gamma.copy_(sae.gamma_init * max(ratio, alpha_floor))
 
             # KL onset: activate when all primal constraints are feasible.
-            # v_ema is TEMA-filtered — represents accumulated feasibility evidence.
             if not kl_active and (controller.v_ema[:controller.n_primal] < 0).all():
                 onset_step = step
                 tokens = next(token_iter).cuda()
@@ -483,7 +465,7 @@ def train(config: DictConfig) -> StratifiedSAE:
                 Path(config.output_dir) / f"checkpoint_step{step}",
                 sae, optimizer, scheduler, controller,
                 whitener, W_vocab, cal, config, step, onset_step,
-                lambda_disc, D_ema, D_0,
+                D_ema, D_0,
             )
 
         if step % config.log_interval == 0:
@@ -510,7 +492,7 @@ def train(config: DictConfig) -> StratifiedSAE:
         Path(config.output_dir) / f"checkpoint_step{total_steps}",
         sae, optimizer, scheduler, controller,
         whitener, W_vocab, cal, config, total_steps, onset_step,
-        lambda_disc, D_ema, D_0,
+        D_ema, D_0,
     )
 
     return sae
