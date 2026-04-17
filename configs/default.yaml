@@ -2,10 +2,10 @@ defaults:
   - model: pythia_1b
   - _self_
 
-dataset: "monology/pile-uncopyrighted"
-dataset_config: null
-text_column: "text"
-dataset_split: "train"
+# Dataset is hard-coded in spalf/data/store.py to monology/pile-uncopyrighted.
+# SPALF is deliberately specialized to this corpus; see audit in
+# commit history for rationale.
+
 total_tokens: 1_000_000_000
 
 # Hardware constraints.
@@ -22,5 +22,5 @@ resume_from_checkpoint: ""
 checkpoint_path: ""
 
 # Vocabulary cap (0 = use full vocabulary).
-# Set in model configs for large-vocabulary models to bound memory.
+# Model-side knob for large-vocabulary models to bound memory.
 V_cap: 0

@@ -1,7 +1,7 @@
 import torch
 
 from spalf.data.store import ActivationStore
-from spalf.model.constraints import compute_orthogonality_violation
+from spalf.optim.constraints import compute_orthogonality_violation
 from spalf.model.sae import StratifiedSAE
 
 
@@ -51,6 +51,6 @@ def initialize_from_calibration(cal: dict, store: ActivationStore) -> Stratified
         sae.gamma_init.copy_(sae.gamma)
 
         _, z_init, _, _, _ = sae(x_tilde)
-        raw_ortho = compute_orthogonality_violation(z_init, sae.W_dec_A, sae.W_dec_B, 0.0).item()
+        raw_ortho = compute_orthogonality_violation(z_init, sae.W_dec_A, sae.W_dec_B).item()
     cal["tau_ortho"] = max(raw_ortho, 1.0 / d)
     return sae

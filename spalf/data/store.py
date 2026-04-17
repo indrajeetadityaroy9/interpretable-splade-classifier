@@ -6,18 +6,20 @@ import torch
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+# Target dataset — The Pile (uncopyrighted), train stream, flat "text" schema.
+# Hard-coded because SPALF is deliberately specialized to this corpus; see
+# README for justification of the single-dataset regime.
+DATASET_NAME: str = "monology/pile-uncopyrighted"
+DATASET_SPLIT: str = "train"
+TEXT_COLUMN: str = "text"
+
 
 class ActivationStore:
-    def __init__(self, model_name: str, dataset_name: str, batch_size: int,
-                 seq_len: int = 128, text_column: str = "text", dataset_split: str = "train",
-                 dataset_config: str | None = None, seed: int = 42) -> None:
+    def __init__(self, model_name: str, batch_size: int,
+                 seq_len: int = 128, seed: int = 42) -> None:
         self.model_name = model_name
-        self.dataset_name = dataset_name
         self.batch_size = batch_size
         self.seq_len = seq_len
-        self.text_column = text_column
-        self.dataset_split = dataset_split
-        self.dataset_config = dataset_config
         self.seed = seed
 
         self.model = AutoModelForCausalLM.from_pretrained(
@@ -61,7 +63,10 @@ class ActivationStore:
             handle.remove()
 
     def _token_generator(self, batch_size: int | None = None) -> Iterator[torch.Tensor]:
-        """Yield [batch_size, seq_len] token batches: HF streaming + group_texts chunking."""
+        """Yield [batch_size, seq_len] token batches from the Pile streaming split.
+
+        add_special_tokens=False because Pile docs are concatenated; no inter-doc BOS/EOS.
+        """
         bs = batch_size or self.batch_size
         seq_len = self.seq_len
 
@@ -72,14 +77,13 @@ class ActivationStore:
 
         epoch = 0
         while True:
-            ds = (load_dataset(self.dataset_name, name=self.dataset_config,
-                               split=self.dataset_split, streaming=True)
-                  .select_columns([self.text_column])
+            ds = (load_dataset(DATASET_NAME, split=DATASET_SPLIT, streaming=True)
+                  .select_columns([TEXT_COLUMN])
                   .shuffle(seed=self.seed, buffer_size=self.batch_size * seq_len))
             ds.set_epoch(epoch)
             tokenized = ds.map(
-                lambda ex: self.tokenizer(ex[self.text_column], add_special_tokens=False),
-                batched=True, remove_columns=[self.text_column],
+                lambda ex: self.tokenizer(ex[TEXT_COLUMN], add_special_tokens=False),
+                batched=True, remove_columns=[TEXT_COLUMN],
             )
             chunked = tokenized.map(group, batched=True, batch_size=bs * 4)
             for batch in chunked.iter(batch_size=bs, drop_last_batch=True):

@@ -1,4 +1,4 @@
-"""Dual controller: EMA filtering, PI dual update, monotone penalty."""
+"""Dual controller: EMA filtering, PI dual update, non-monotone penalty, active-subset aware."""
 
 import math
 import torch
@@ -6,10 +6,9 @@ from torch import Tensor
 
 
 class DualController:
-    def __init__(self, initial_violations: Tensor, rho_0: float, n_primal: int) -> None:
+    def __init__(self, initial_violations: Tensor, rho_0: float) -> None:
         n = initial_violations.shape[0]
         self.n_constraints = n
-        self.n_primal = n_primal
 
         self._ema1 = torch.zeros(n, device="cuda")
         self._lambdas = torch.zeros(n, device="cuda")
@@ -22,29 +21,35 @@ class DualController:
         self._n_dual_updates = 0
         self._next_slow_step = 0
 
-    def _adaptive_beta(self) -> float:
-        t = max(self._n_updates, self.n_constraints)
+    def _adaptive_beta(self, n_active: int) -> float:
+        """Harmonic gain t/(t+1) with n_active burn-in (Robbins-Monro)."""
+        t = max(self._n_updates, n_active)
         return t / (t + 1)
 
-    def update(self, violations: Tensor) -> None:
+    def update(self, active_violations: Tensor, idx: list[int]) -> None:
+        """Per-step EMA update on the active subset only."""
         self._n_updates += 1
-        beta = self._adaptive_beta()
+        beta = self._adaptive_beta(len(idx))
         self._log_bc += math.log(beta)
-        self._ema1.mul_(beta).add_(violations.detach(), alpha=1.0 - beta)
+        self._ema1[idx] = beta * self._ema1[idx] + (1.0 - beta) * active_violations.detach()
 
-    def step(self) -> None:
-        v = self.v_ema
-        self._lambdas = (self._lambdas + self._rhos * (2.0 * v - self._v_prev)).clamp_min(0.0)
-        self._v_prev = v.clone()
-        self._rhos = self._etas * v.abs().rsqrt()
+    def step(self, idx: list[int]) -> None:
+        """PI dual update + non-monotone ρ recompute on active slots only."""
+        v = self.v_ema[idx]
+        self._lambdas[idx] = (
+            self._lambdas[idx] + self._rhos[idx] * (2.0 * v - self._v_prev[idx])
+        ).clamp_min(0.0)
+        self._v_prev[idx] = v.clone()
+        self._rhos[idx] = self._etas[idx] * v.abs().rsqrt()
 
-    def recalibrate(self, index: int, initial_violation: float) -> None:
+    def activate(self, index: int, initial_violation: float) -> None:
+        """Bring a dormant constraint online: reset its η, ema1, v_prev."""
         self._etas[index] = abs(initial_violation) ** -0.5
         self._ema1[index] = 0.0
         self._v_prev[index] = 0.0
 
     def should_do_slow_update(self, step: int) -> bool:
-        """Triangular spacing: interval grows as n_dual_updates, ~√(2T) total."""
+        """Triangular spacing: ~√(2T) slow updates over T steps."""
         if step >= self._next_slow_step:
             self._n_dual_updates += 1
             self._next_slow_step = step + self._n_dual_updates
@@ -61,7 +66,6 @@ class DualController:
             "lambdas": self._lambdas, "v_prev": self._v_prev,
             "etas": self._etas, "rhos": self._rhos,
             "n_dual_updates": self._n_dual_updates, "next_slow_step": self._next_slow_step,
-            "n_primal": self.n_primal,
         }
 
     def load_state_dict(self, sd: dict) -> None:
@@ -74,4 +78,3 @@ class DualController:
         self._log_bc = float(sd["log_bc"])
         self._n_dual_updates = int(sd["n_dual_updates"])
         self._next_slow_step = int(sd["next_slow_step"])
-        self.n_primal = int(sd["n_primal"])

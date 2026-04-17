@@ -1,12 +1,8 @@
-import math
 import torch
 import torch.nn as nn
 from torch import Tensor
 
 from spalf.model.kernel import FusedJumpReLUFunction
-
-# IQR-to-σ ratio for standard normal: 2·Φ⁻¹(0.75) = 2·√2·erfinv(0.5).
-_IQR_SIGMA: float = 2.0 * math.sqrt(2.0) * math.erfinv(0.5)
 
 
 class StratifiedSAE(nn.Module):
@@ -41,22 +37,9 @@ class StratifiedSAE(nn.Module):
 
     @torch.no_grad()
     def recalibrate_gamma(self, pre_act: Tensor) -> None:
-        """Density-matched Moreau bandwidth: c = q/(IQR_σ·φ(z_q))."""
-        thresholds = self.log_threshold.exp()
-
-        global_iqr = torch.quantile(pre_act, 0.75, dim=0) - torch.quantile(pre_act, 0.25, dim=0)
-        mask = (pre_act > (thresholds - global_iqr)) & (pre_act < (thresholds + global_iqr))
-
-        masked = pre_act.masked_fill(~mask, float("nan"))
-        iqr = torch.nanquantile(masked, 0.75, dim=0) - torch.nanquantile(masked, 0.25, dim=0)
-        iqr = torch.where(iqr.isnan(), global_iqr, iqr)
-
-        q = (pre_act > thresholds).float().mean(dim=0).clamp_min(1.0 / self.F)
-        z_q = torch.erfinv(1.0 - 2.0 * q) * math.sqrt(2)
-        phi_zq = torch.exp(-z_q.pow(2) / 2.0) / math.sqrt(2 * math.pi)
-        c = (q / (_IQR_SIGMA * phi_zq)).clamp_max(1.0)
-
-        self.gamma.copy_((c * iqr).pow(2) / 2.0)
+        """Moreau bandwidth tied to per-feature IQR: zone width √(2γ) = iqr."""
+        iqr = torch.quantile(pre_act, 0.75, dim=0) - torch.quantile(pre_act, 0.25, dim=0)
+        self.gamma.copy_(iqr.pow(2) / 2.0)
 
     @torch.no_grad()
     def normalize_free_decoder(self) -> None:

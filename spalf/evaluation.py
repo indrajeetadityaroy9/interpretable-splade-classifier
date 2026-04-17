@@ -65,10 +65,9 @@ def evaluate_checkpoint(config: DictConfig) -> dict:
     )
 
     store = ActivationStore(
-        model_name=config.model_name, dataset_name=config.dataset,
+        model_name=config.model_name,
         batch_size=config.batch_size, seq_len=config.seq_len,
-        text_column=config.text_column, dataset_split=config.dataset_split,
-        dataset_config=config.dataset_config, seed=config.seed + 1,
+        seed=config.seed + 1,
     )
     buffer = ActivationBuffer(store, buffer_size=config.seq_len * config.batch_size)
 

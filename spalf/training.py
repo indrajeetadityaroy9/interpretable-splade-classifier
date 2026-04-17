@@ -12,8 +12,8 @@ from spalf.data.store import ActivationStore
 from spalf.data.buffer import ActivationBuffer
 from spalf.evaluation import run_patched_forward, compute_kl
 from spalf.model.sae import StratifiedSAE
-from spalf.model.constraints import compute_orthogonality_violation
 from spalf.model.initialization import initialize_from_calibration
+from spalf.optim.constraints import Constraint, ConstraintSet, Ctx, compute_orthogonality_violation
 from spalf.optim.controller import DualController
 from spalf.optim.lagrangian import compute_augmented_lagrangian
 from spalf.whitening import FrequentDirections, SoftZCAWhitener
@@ -49,12 +49,11 @@ def _calibrate(config: DictConfig, store: ActivationStore) -> dict:
         "tau_drift": W_vocab.pow(2).sum().item() / d,
         "tau_ortho": 0.0, "tau_kl": None,
         "total_steps": total_steps,
-        "lr": 1.0 / n_params ** 0.5,                          # McCandlish et al.
+        "lr": 1.0 / n_params ** 0.5,
         "warmup_steps": round(total_steps ** 0.5),
         "n_cal_batches": math.ceil(F / config.batch_size),
         "buffer_size": config.seq_len * config.batch_size,
         "l0_scale": L0 / F,
-        "n_primal": 3, "n_onset": 1,
         "whitener": whitener, "W_vocab": W_vocab,
     }
     print(json.dumps({"event": "derived_hyperparameters",
@@ -64,7 +63,40 @@ def _calibrate(config: DictConfig, store: ActivationStore) -> dict:
     return cal
 
 
-def _save_checkpoint(output_dir, sae, optimizer, scheduler, controller,
+def _build_constraints(cal: dict) -> ConstraintSet:
+    """Register the four SPALF constraints; KL is dormant until primal feasibility.
+
+    Fns read all per-step state (including whitener + W_vocab) via Ctx, so
+    checkpoint-resume rebinding doesn't stale-reference pre-resume tensors.
+    """
+    return ConstraintSet([
+        Constraint(
+            name="faith",
+            fn=lambda c: c.whitener.compute_mahalanobis_sq(c.x - c.x_hat).mean(),
+            tau=cal["tau_faith"],
+        ),
+        Constraint(
+            name="drift",
+            fn=lambda c: (c.sae.W_dec_A - c.W_vocab).pow(2).sum(),
+            tau=cal["tau_drift"],
+        ),
+        Constraint(
+            name="ortho",
+            fn=lambda c: compute_orthogonality_violation(c.z, c.sae.W_dec_A, c.sae.W_dec_B),
+            tau=cal["tau_ortho"],
+        ),
+        Constraint(
+            name="kl",
+            fn=lambda c: c.kl_div,
+            tau=cal["tau_kl"] if cal["tau_kl"] is not None else 0.0,
+            onset=lambda v_primal, ctx: bool((v_primal < 0).all().item()),
+            needs_kl=True,
+            active=cal["tau_kl"] is not None,
+        ),
+    ])
+
+
+def _save_checkpoint(output_dir, sae, optimizer, scheduler, controller, cs,
                      whitener, W_vocab, cal, config, step, onset_step, D_ema, D_0) -> None:
     ckpt_dir = Path(output_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -74,13 +106,18 @@ def _save_checkpoint(output_dir, sae, optimizer, scheduler, controller,
                ckpt_dir / "training_state.pt")
     save_file({**whitener.state_dict(), "W_vocab": W_vocab},
               str(ckpt_dir / "calibration.safetensors"))
+    kl_c = cs.by_name("kl")
     with open(ckpt_dir / "metadata.json", "w") as f:
         json.dump({
             "step": step, "onset_step": onset_step,
             "config": OmegaConf.to_container(config, resolve=True),
-            "calibration": {k: cal[k] for k in
-                            ("d", "V", "F", "L0_target",
-                             "tau_faith", "tau_drift", "tau_ortho", "tau_kl")},
+            "calibration": {
+                "d": cal["d"], "V": cal["V"], "F": cal["F"], "L0_target": cal["L0_target"],
+                "tau_faith": cs.by_name("faith").tau,
+                "tau_drift": cs.by_name("drift").tau,
+                "tau_ortho": cs.by_name("ortho").tau,
+                "tau_kl": kl_c.tau if kl_c.active else None,
+            },
             "D_ema": D_ema.item(), "D_0": D_0.item(),
         }, f, indent=2)
 
@@ -90,10 +127,9 @@ def train(config: DictConfig) -> StratifiedSAE:
     set_seed(config.seed)
 
     store = ActivationStore(
-        model_name=config.model_name, dataset_name=config.dataset,
+        model_name=config.model_name,
         batch_size=config.batch_size, seq_len=config.seq_len,
-        text_column=config.text_column, dataset_split=config.dataset_split,
-        dataset_config=config.dataset_config, seed=config.seed,
+        seed=config.seed,
     )
 
     cal = _calibrate(config, store)
@@ -103,27 +139,32 @@ def train(config: DictConfig) -> StratifiedSAE:
     sae = initialize_from_calibration(cal, store)
     sae = torch.compile(sae, mode="max-autotune")
 
-    # Initial violations + transition-zone mass D_0 via n_cal_batches warmup.
-    accum = torch.zeros(cal["n_primal"], device="cuda")
+    cs = _build_constraints(cal)
+    n_cs = len(cs.cs)
+
+    # Initial violations (active-slot raw + inactive placeholder 1.0) + D_0.
+    accum = torch.zeros(n_cs, device="cuda")
     D_accum = 0.0
+    active_idx = cs.active_indices()
     with torch.no_grad():
         for _ in range(cal["n_cal_batches"]):
             x = buffer.next_batch(config.batch_size)
             x_tilde = whitener.forward(x)
             x_hat, z, _, _, disc = sae(x_tilde)
             D_accum += disc.mean().item()
-            v_faith = whitener.compute_mahalanobis_sq(x - x_hat).mean() - cal["tau_faith"]
-            v_drift = (sae.W_dec_A - W_vocab).pow(2).sum() - cal["tau_drift"]
-            v_ortho = compute_orthogonality_violation(z, sae.W_dec_A, sae.W_dec_B, cal["tau_ortho"])
-            accum += torch.stack([v_faith, v_drift, v_ortho]).abs()
-    initial_violations = torch.cat([accum / cal["n_cal_batches"],
-                                    torch.ones(cal["n_onset"], device="cuda")])
+            ctx = Ctx(sae=sae, whitener=whitener, W_vocab=W_vocab,
+                      x=x, x_hat=x_hat, z=z, kl_div=None)
+            accum[active_idx] += cs.violations(ctx).abs()
+    initial_violations = accum / cal["n_cal_batches"]
+    for i, c in enumerate(cs.cs):
+        if not c.active:
+            initial_violations[i] = 1.0
     D_0 = torch.tensor(D_accum / cal["n_cal_batches"], device="cuda")
     D_ema = D_0.clone()
 
     total_steps = cal["total_steps"]
     rho_0 = cal["l0_scale"] / initial_violations.abs().mean().item()
-    controller = DualController(initial_violations, rho_0, n_primal=cal["n_primal"])
+    controller = DualController(initial_violations, rho_0)
 
     optimizer = torch.optim.Adam(sae.parameters(), lr=cal["lr"], fused=True)
 
@@ -132,7 +173,6 @@ def train(config: DictConfig) -> StratifiedSAE:
     clip_params = [p for p in sae.parameters() if p.data.ndim > 1]
     ema_norms = [p.data.norm().clone() for p in clip_params]
 
-    # WSD: warmup √T, stable, decay √T.
     warmup = decay = cal["warmup_steps"]
     scheduler = get_wsd_schedule(optimizer, warmup, total_steps - 2 * warmup, decay)
 
@@ -152,8 +192,14 @@ def train(config: DictConfig) -> StratifiedSAE:
         with open(ckpt_path / "metadata.json") as f:
             meta = json.load(f)
         start_step, onset_step = meta["step"], meta["onset_step"]
-        for k in ("tau_faith", "tau_drift", "tau_ortho", "tau_kl"):
-            cal[k] = meta["calibration"][k]
+        meta_cal = meta["calibration"]
+        cs.by_name("faith").tau = meta_cal["tau_faith"]
+        cs.by_name("drift").tau = meta_cal["tau_drift"]
+        cs.by_name("ortho").tau = meta_cal["tau_ortho"]
+        if meta_cal["tau_kl"] is not None:
+            kl_c = cs.by_name("kl")
+            kl_c.tau = meta_cal["tau_kl"]
+            kl_c.active = True
         D_0 = torch.tensor(meta["D_0"], device="cuda")
         D_ema = torch.tensor(meta["D_ema"], device="cuda")
 
@@ -161,47 +207,44 @@ def train(config: DictConfig) -> StratifiedSAE:
     whitener.compute_mahalanobis_sq = torch.compile(whitener.compute_mahalanobis_sq)
 
     token_iter = store._token_generator(config.batch_size)
-    tau_kl = cal["tau_kl"]
-    kl_active = tau_kl is not None
-    alpha_floor = (cal["d"] / cal["F"]) ** 2
-    kl_sentinel = -torch.tensor([cal["tau_faith"], cal["tau_drift"], cal["tau_ortho"]],
-                                device="cuda").sum()
 
-    # Dead threshold: P(0 firings in N) < 1/F  ⇒  N > F·ln(F)/(B·L0).
+    # Dead threshold: resample at most once per max(Poisson-bound, F/B) steps.
+    # Poisson bound: P(0 firings in N) < 1/F  ⇒  N > F·ln(F)/(B·L0).
     dead_threshold = max(
         math.ceil(cal["F"] * math.log(cal["F"]) / (config.batch_size * cal["L0_target"])),
-        cal["n_cal_batches"],
+        math.ceil(cal["F"] / config.batch_size),
     )
 
+    kl_idx = cs.index_of("kl")
+    primal_idx = cs.primal_indices()
+
     for step in range(start_step, total_steps):
-        # ── Forward + violations ─────────────────────────────────
+        # Pre-forward: compute KL div only if KL constraint is active.
         kl_div = None
-        if kl_active:
+        if cs.active_needs_kl():
             with torch.no_grad():
-                orig_logits, patched_logits = run_patched_forward(
+                orig, patched = run_patched_forward(
                     store, sae, whitener, next(token_iter).cuda(),
                 )
-                kl_div = compute_kl(orig_logits, patched_logits)
+                kl_div = compute_kl(orig, patched)
 
         x = buffer.next_batch(config.batch_size)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             x_tilde = whitener.forward(x)
             x_hat, z, gate_mask, l0_probs, disc_penalty = sae(x_tilde)
 
-        v_faith = whitener.compute_mahalanobis_sq(x - x_hat).mean() - cal["tau_faith"]
-        v_drift = (sae.W_dec_A - W_vocab).pow(2).sum() - cal["tau_drift"]
-        v_ortho = compute_orthogonality_violation(z, sae.W_dec_A, sae.W_dec_B, cal["tau_ortho"])
-        v_kl = (kl_div - tau_kl) if kl_active else kl_sentinel
-        violations = torch.stack([v_faith, v_drift, v_ortho, v_kl])
+        ctx = Ctx(sae=sae, whitener=whitener, W_vocab=W_vocab,
+                  x=x, x_hat=x_hat, z=z, kl_div=kl_div)
+        violations = cs.violations(ctx)
+        idx = cs.active_indices()
 
-        controller.update(violations)
-        beta = controller._adaptive_beta()
+        controller.update(violations, idx)
+        beta = controller._adaptive_beta(len(idx))
         D_ema.mul_(beta).add_(disc_penalty.mean(), alpha=1.0 - beta)
 
-        # ── AL objective + step ──────────────────────────────────
         lagrangian = compute_augmented_lagrangian(
             l0_probs.mean() + disc_penalty.mean(), violations,
-            controller._lambdas, controller._rhos,
+            controller._lambdas[idx], controller._rhos[idx],
         )
         optimizer.zero_grad(set_to_none=True)
         lagrangian.backward()
@@ -219,36 +262,38 @@ def train(config: DictConfig) -> StratifiedSAE:
         scheduler.step()
         sae.update_dead_counts(gate_mask)
 
-        # ── Slow-timescale (MTZF γ anneal + KL onset) ────────────
+        # Slow-timescale: PI dual step, MTZF γ anneal with t^(-1/3) floor, dormant onset.
         if controller.should_do_slow_update(step):
-            controller.step()
+            controller.step(idx)
 
+            alpha_floor = (controller._n_dual_updates + 1) ** (-1.0 / 3.0)
             ratio = min((D_ema / D_0).item(), 1.0)
             with torch.no_grad():
                 sae.gamma.copy_(sae.gamma_init * max(ratio, alpha_floor))
 
-            if not kl_active and (controller.v_ema[:controller.n_primal] < 0).all():
-                onset_step = step
+            kl_c = cs.by_name("kl")
+            if not kl_c.active and kl_c.onset(controller.v_ema[primal_idx], ctx):
                 with torch.no_grad():
-                    orig_logits, patched_logits = run_patched_forward(
+                    orig, patched = run_patched_forward(
                         store, sae, whitener, next(token_iter).cuda(),
                     )
-                    tau_kl = compute_kl(orig_logits, patched_logits).item()
-                cal["tau_kl"] = tau_kl
-                controller.recalibrate(controller.n_primal, tau_kl)
-                kl_active = True
+                    tau_kl = compute_kl(orig, patched).item()
+                kl_c.tau = tau_kl
+                kl_c.active = True
+                onset_step = step
+                controller.activate(kl_idx, tau_kl)
                 print(json.dumps({"event": "kl_onset", "step": step, "tau_kl": tau_kl},
                                  sort_keys=True), flush=True)
 
         sae.normalize_free_decoder()
 
-        if kl_active and step % dead_threshold == 0:
+        # Dead-feature resample: decoupled from KL activation, gated on post-onset.
+        if step > onset_step and step % dead_threshold == 0:
             sae.resample_dead_features(x_tilde, x_hat, dead_threshold, cal["L0_target"])
 
-        # ── Checkpointing + logging ──────────────────────────────
         if config.checkpoint_interval > 0 and step % config.checkpoint_interval == 0:
             _save_checkpoint(Path(config.output_dir) / f"checkpoint_step{step}",
-                             sae, optimizer, scheduler, controller,
+                             sae, optimizer, scheduler, controller, cs,
                              whitener, W_vocab, cal, config, step, onset_step, D_ema, D_0)
 
         if step % config.log_interval == 0:
@@ -259,11 +304,11 @@ def train(config: DictConfig) -> StratifiedSAE:
             l0_mean, mse, x_var = scalars.tolist()
             metrics = {"event": "train_step", "step": step,
                        "l0": l0_mean, "r2": 1.0 - mse / x_var}
-            if kl_active:
-                metrics["v_kl"] = controller.v_ema[controller.n_primal].item()
+            if cs.by_name("kl").active:
+                metrics["v_kl"] = controller.v_ema[kl_idx].item()
             print(json.dumps(metrics, sort_keys=True), flush=True)
 
     _save_checkpoint(Path(config.output_dir) / f"checkpoint_step{total_steps}",
-                     sae, optimizer, scheduler, controller,
+                     sae, optimizer, scheduler, controller, cs,
                      whitener, W_vocab, cal, config, total_steps, onset_step, D_ema, D_0)
     return sae
